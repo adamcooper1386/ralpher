@@ -11,6 +11,7 @@ Before working on this project, read these files in order:
 1. `product/mission.md` - Core philosophy and goals
 2. `product/prd.md` - Features, user stories, and acceptance criteria
 3. `product/tech.md` - Architecture and implementation details
+4. `product/iterations.md` - What was done in each iteration
 
 ## Development Workflow
 
