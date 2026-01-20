@@ -6,18 +6,22 @@ sandbox:
   inherit_env: true
 
 tests:
-  - name: "abort with config runs"
+  - name: "abort with no active run fails"
     setup:
       - write_file:
           path: "ralpher.toml"
           contents: |
             # minimal
+      - write_file:
+          path: "ralpher.prd.json"
+          contents: |
+            {"tasks": []}
     steps:
       - name: run
         run:
           cmd: "${BINARY}"
           args: ["abort"]
         expect:
-          exit: 0
-          stdout:
-            contains: "Would abort current run"
+          exit: 1
+          stderr:
+            contains: "No active run to abort"

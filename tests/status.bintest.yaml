@@ -6,7 +6,7 @@ sandbox:
   inherit_env: true
 
 tests:
-  - name: "status with config shows checking message"
+  - name: "status with config but no run shows no active run"
     setup:
       - write_file:
           path: "ralpher.toml"
@@ -20,4 +20,29 @@ tests:
         expect:
           exit: 0
           stdout:
-            contains: "Config found"
+            contains: "No active run"
+
+  - name: "status with config and tasks shows progress"
+    setup:
+      - write_file:
+          path: "ralpher.toml"
+          contents: |
+            # minimal config
+      - write_file:
+          path: "ralpher.prd.json"
+          contents: |
+            {
+              "tasks": [
+                {"id": "t1", "title": "Task one", "status": "done"},
+                {"id": "t2", "title": "Task two", "status": "todo"}
+              ]
+            }
+    steps:
+      - name: run
+        run:
+          cmd: "${BINARY}"
+          args: ["status"]
+        expect:
+          exit: 0
+          stdout:
+            contains: "Progress: 50%"

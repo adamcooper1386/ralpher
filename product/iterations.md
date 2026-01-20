@@ -69,3 +69,45 @@ Track what was accomplished in each development iteration.
 - Added `FileChange` struct and `ChangeType` enum for diff parsing
 - Added 13 unit tests for workspace module
 - All checks pass: fmt, clippy, test (38 total tests)
+
+## Iteration 6
+
+- Wired up CLI command handlers to use RunEngine (headless mode)
+- Implemented `status` command:
+  - Shows run state, iteration count, current task when run exists
+  - Shows task progress (% done, counts by status)
+  - Shows "No active run" when no run exists
+- Implemented `start` command:
+  - Creates new RunEngine and starts run
+  - Checks for existing active runs (fails if one exists)
+  - Runs one iteration in headless mode
+- Implemented `continue` command:
+  - Resumes paused runs or starts new runs
+  - Handles all run states appropriately
+  - Runs one iteration in headless mode
+- Implemented `abort` command:
+  - Aborts active runs with "User requested abort" reason
+  - Fails gracefully if no active run exists
+- Implemented `clean` command:
+  - Removes `.ralpher/` directory
+  - Refuses to clean if run is still active
+  - Shows message if nothing to clean
+- Updated bintest integration tests to match new behavior
+- All checks pass: fmt, clippy, test (53 unit tests), bintest (26 integration tests)
+
+## Iteration 7
+
+- Implemented agent command execution in RunEngine (`src/run.rs`)
+- Added `execute_agent()` method that:
+  - Reads agent command from `config.agent.cmd`
+  - Spawns the command as a child process
+  - Creates iteration directory `.ralpher/iterations/<n>/`
+  - Captures stdout/stderr to `agent.log`
+  - Returns exit code (0 = success)
+- Added `iteration_dir()` helper method for iteration path construction
+- Wired `execute_agent()` into `next_iteration()`:
+  - Replaces simulated success with actual command execution
+  - Agent errors are logged but don't crash the run (treated as exit code -1)
+- Graceful error handling when agent config is missing
+- Updated test fixtures to configure a simple agent (`true` command)
+- All checks pass: fmt, clippy, test (53 unit tests), bintest (26 integration tests)

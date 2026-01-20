@@ -6,7 +6,7 @@ sandbox:
   inherit_env: true
 
 tests:
-  - name: "start with config loads and runs"
+  - name: "start without task file fails"
     setup:
       - write_file:
           path: "ralpher.toml"
@@ -18,6 +18,6 @@ tests:
           cmd: "${BINARY}"
           args: ["start"]
         expect:
-          exit: 0
-          stdout:
-            contains: "Loaded config from"
+          exit: 1
+          stderr:
+            contains: "No ralpher.prd.json found"

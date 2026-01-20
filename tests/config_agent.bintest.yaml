@@ -6,7 +6,7 @@ sandbox:
   inherit_env: true
 
 tests:
-  - name: "config with agent section parses"
+  - name: "config with agent section - status works"
     setup:
       - write_file:
           path: "ralpher.toml"
@@ -20,8 +20,8 @@ tests:
       - name: run
         run:
           cmd: "${BINARY}"
-          args: ["continue"]
+          args: ["status"]
         expect:
           exit: 0
           stdout:
-            contains: "Git mode: Branch"
+            contains: "No active run"

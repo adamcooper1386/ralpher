@@ -50,18 +50,18 @@ tests:
           stdout:
             contains: "No ralpher.toml found"
 
-  - name: "abort without config shows message"
+  - name: "abort without config fails"
     steps:
       - name: run
         run:
           cmd: "${BINARY}"
           args: ["abort"]
         expect:
-          exit: 0
-          stdout:
+          exit: 1
+          stderr:
             contains: "No ralpher.toml found"
 
-  - name: "clean without config shows message"
+  - name: "clean without .ralpher shows nothing to clean"
     steps:
       - name: run
         run:
@@ -70,4 +70,4 @@ tests:
         expect:
           exit: 0
           stdout:
-            contains: "No ralpher.toml found"
+            contains: "No .ralpher/ directory found"

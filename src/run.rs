@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{Config, GitMode};
@@ -11,6 +14,8 @@ use crate::workspace::WorkspaceManager;
 const RALPHER_DIR: &str = ".ralpher";
 const RUN_FILE: &str = "run.json";
 const EVENTS_FILE: &str = "events.ndjson";
+const ITERATIONS_DIR: &str = "iterations";
+const AGENT_LOG_FILE: &str = "agent.log";
 
 /// State of a ralpher run.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
@@ -326,9 +331,15 @@ impl RunEngine {
             })?;
         }
 
-        // TODO: Execute agent command (for now, simulate success)
-        // This would call the configured agent command and capture output
-        let agent_exit_code = Some(0); // Simulated success
+        // Execute agent command
+        let agent_exit_code = match self.execute_agent(&task.id, &task.title) {
+            Ok(code) => Some(code),
+            Err(e) => {
+                // Log the error but don't fail the run - treat as agent failure
+                eprintln!("Agent execution error: {}", e);
+                Some(-1)
+            }
+        };
 
         self.event_log.emit_now(EventKind::AgentCompleted {
             run_id: self.run.run_id.clone(),
@@ -356,6 +367,80 @@ impl RunEngine {
             validators_passed,
             checkpoint_sha: None,
         })
+    }
+
+    /// Get the path to the iteration directory for a given iteration number.
+    fn iteration_dir(&self, iteration: u32) -> PathBuf {
+        self.repo_path
+            .join(RALPHER_DIR)
+            .join(ITERATIONS_DIR)
+            .join(iteration.to_string())
+    }
+
+    /// Execute the configured agent command.
+    /// Returns the exit code (0 = success, non-zero = failure).
+    fn execute_agent(&self, task_id: &str, task_title: &str) -> Result<i32> {
+        let agent_config = self.config.agent.as_ref().context(
+            "No agent configured in ralpher.toml. Add [agent] section with type and cmd.",
+        )?;
+
+        if agent_config.cmd.is_empty() {
+            anyhow::bail!("Agent command is empty");
+        }
+
+        // Create iteration directory
+        let iter_dir = self.iteration_dir(self.run.iteration);
+        fs::create_dir_all(&iter_dir).with_context(|| {
+            format!(
+                "Failed to create iteration directory: {}",
+                iter_dir.display()
+            )
+        })?;
+
+        // Open log file for agent output
+        let log_path = iter_dir.join(AGENT_LOG_FILE);
+        let mut log_file = File::create(&log_path)
+            .with_context(|| format!("Failed to create agent log: {}", log_path.display()))?;
+
+        // Write header to log
+        writeln!(
+            log_file,
+            "=== ralpher agent execution ===\nIteration: {}\nTask: {} - {}\nCommand: {:?}\n",
+            self.run.iteration, task_id, task_title, agent_config.cmd
+        )?;
+
+        // Build the command
+        let program = &agent_config.cmd[0];
+        let args = &agent_config.cmd[1..];
+
+        // Execute the command
+        let output = Command::new(program)
+            .args(args)
+            .current_dir(&self.repo_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .with_context(|| format!("Failed to execute agent command: {}", program))?;
+
+        // Write stdout to log
+        if !output.stdout.is_empty() {
+            writeln!(log_file, "=== stdout ===")?;
+            log_file.write_all(&output.stdout)?;
+            writeln!(log_file)?;
+        }
+
+        // Write stderr to log
+        if !output.stderr.is_empty() {
+            writeln!(log_file, "=== stderr ===")?;
+            log_file.write_all(&output.stderr)?;
+            writeln!(log_file)?;
+        }
+
+        // Write exit code
+        let exit_code = output.status.code().unwrap_or(-1);
+        writeln!(log_file, "=== exit code: {} ===", exit_code)?;
+
+        Ok(exit_code)
     }
 
     /// Update a task's status and emit an event.
@@ -506,6 +591,7 @@ impl RunEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AgentConfig;
     use crate::task::Task;
     use std::fs;
     use std::process::Command;
@@ -547,10 +633,13 @@ mod tests {
             .output()
             .unwrap();
 
-        // Create config
+        // Create config with a simple agent that always succeeds
         let config = Config {
             git_mode: GitMode::Branch,
-            agent: None,
+            agent: Some(AgentConfig {
+                runner_type: "command".to_string(),
+                cmd: vec!["true".to_string()],
+            }),
         };
 
         // Create task list with sample tasks

@@ -6,7 +6,7 @@ sandbox:
   inherit_env: true
 
 tests:
-  - name: "continue shows git mode trunk"
+  - name: "continue with trunk mode and no task file fails"
     setup:
       - write_file:
           path: "ralpher.toml"
@@ -18,6 +18,6 @@ tests:
           cmd: "${BINARY}"
           args: ["continue"]
         expect:
-          exit: 0
-          stdout:
-            contains: "Git mode: Trunk"
+          exit: 1
+          stderr:
+            contains: "No ralpher.prd.json found"

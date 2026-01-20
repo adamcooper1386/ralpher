@@ -6,12 +6,12 @@ sandbox:
   inherit_env: true
 
 tests:
-  - name: "validate with config runs"
+  - name: "validate with config shows not implemented"
     setup:
       - write_file:
           path: "ralpher.toml"
           contents: |
-            git_mode = "branch"
+            # minimal
     steps:
       - name: run
         run:
@@ -20,4 +20,4 @@ tests:
         expect:
           exit: 0
           stdout:
-            contains: "Would run validators"
+            contains: "Validators not yet implemented"

@@ -6,7 +6,7 @@ sandbox:
   inherit_env: true
 
 tests:
-  - name: "clean with config runs"
+  - name: "clean with no .ralpher dir shows nothing to clean"
     setup:
       - write_file:
           path: "ralpher.toml"
@@ -20,4 +20,4 @@ tests:
         expect:
           exit: 0
           stdout:
-            contains: "Would clean .ralpher/ artifacts"
+            contains: "No .ralpher/ directory found"
