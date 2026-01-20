@@ -1,0 +1,23 @@
+version: 1
+binary: ../target/release/ralpher
+
+sandbox:
+  workdir: temp
+  inherit_env: true
+
+tests:
+  - name: "status with config shows checking message"
+    setup:
+      - write_file:
+          path: "ralpher.toml"
+          contents: |
+            # minimal config
+    steps:
+      - name: run
+        run:
+          cmd: "${BINARY}"
+          args: ["status"]
+        expect:
+          exit: 0
+          stdout:
+            contains: "Config found"

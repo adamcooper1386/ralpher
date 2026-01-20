@@ -1,0 +1,95 @@
+version: 1
+binary: ../target/release/ralpher
+
+sandbox:
+  workdir: temp
+  inherit_env: true
+
+tests:
+  - name: "help flag shows usage"
+    steps:
+      - name: run
+        run:
+          cmd: "${BINARY}"
+          args: ["--help"]
+        expect:
+          exit: 0
+          stdout:
+            contains: "A TUI that cooks AI development plans to completion"
+
+  - name: "version flag shows version"
+    steps:
+      - name: run
+        run:
+          cmd: "${BINARY}"
+          args: ["--version"]
+        expect:
+          exit: 0
+          stdout:
+            contains: "ralpher"
+
+  - name: "subcommand help - continue"
+    steps:
+      - name: run
+        run:
+          cmd: "${BINARY}"
+          args: ["continue", "--help"]
+        expect:
+          exit: 0
+          stdout:
+            contains: "Continue an existing run"
+
+  - name: "subcommand help - start"
+    steps:
+      - name: run
+        run:
+          cmd: "${BINARY}"
+          args: ["start", "--help"]
+        expect:
+          exit: 0
+          stdout:
+            contains: "Start a new run"
+
+  - name: "subcommand help - status"
+    steps:
+      - name: run
+        run:
+          cmd: "${BINARY}"
+          args: ["status", "--help"]
+        expect:
+          exit: 0
+          stdout:
+            contains: "Show current run status"
+
+  - name: "subcommand help - validate"
+    steps:
+      - name: run
+        run:
+          cmd: "${BINARY}"
+          args: ["validate", "--help"]
+        expect:
+          exit: 0
+          stdout:
+            contains: "Run validators only"
+
+  - name: "subcommand help - abort"
+    steps:
+      - name: run
+        run:
+          cmd: "${BINARY}"
+          args: ["abort", "--help"]
+        expect:
+          exit: 0
+          stdout:
+            contains: "Abort the current run"
+
+  - name: "subcommand help - clean"
+    steps:
+      - name: run
+        run:
+          cmd: "${BINARY}"
+          args: ["clean", "--help"]
+        expect:
+          exit: 0
+          stdout:
+            contains: "Remove temporary artifacts"

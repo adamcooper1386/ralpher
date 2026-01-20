@@ -1,0 +1,27 @@
+version: 1
+binary: ../target/release/ralpher
+
+sandbox:
+  workdir: temp
+  inherit_env: true
+
+tests:
+  - name: "config with agent section parses"
+    setup:
+      - write_file:
+          path: "ralpher.toml"
+          contents: |
+            git_mode = "branch"
+
+            [agent]
+            type = "command"
+            cmd = ["echo", "hello"]
+    steps:
+      - name: run
+        run:
+          cmd: "${BINARY}"
+          args: ["continue"]
+        expect:
+          exit: 0
+          stdout:
+            contains: "Git mode: Branch"

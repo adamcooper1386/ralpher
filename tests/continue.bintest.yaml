@@ -1,0 +1,23 @@
+version: 1
+binary: ../target/release/ralpher
+
+sandbox:
+  workdir: temp
+  inherit_env: true
+
+tests:
+  - name: "continue with config loads and runs"
+    setup:
+      - write_file:
+          path: "ralpher.toml"
+          contents: |
+            git_mode = "branch"
+    steps:
+      - name: run
+        run:
+          cmd: "${BINARY}"
+          args: ["continue"]
+        expect:
+          exit: 0
+          stdout:
+            contains: "Loaded config from"

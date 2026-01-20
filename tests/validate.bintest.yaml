@@ -1,0 +1,23 @@
+version: 1
+binary: ../target/release/ralpher
+
+sandbox:
+  workdir: temp
+  inherit_env: true
+
+tests:
+  - name: "validate with config runs"
+    setup:
+      - write_file:
+          path: "ralpher.toml"
+          contents: |
+            git_mode = "branch"
+    steps:
+      - name: run
+        run:
+          cmd: "${BINARY}"
+          args: ["validate"]
+        expect:
+          exit: 0
+          stdout:
+            contains: "Would run validators"
