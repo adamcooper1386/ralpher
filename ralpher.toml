@@ -1,0 +1,12 @@
+# ralpher configuration for self-development
+# This allows ralpher to drive its own development via Claude Code
+
+git_mode = "branch"
+
+[agent]
+type = "command"
+cmd = [
+    "claude",
+    "-p",
+    "Read CLAUDE.md, then ralpher.prd.json to find the current task (first 'todo' or 'in_progress'). Implement that task following the project conventions. After completing the task, update ralpher.prd.json to mark it 'done'. Run all checks before finishing."
+]

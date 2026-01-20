@@ -1,0 +1,113 @@
+{
+  "tasks": [
+    {
+      "id": "prompt-composition",
+      "title": "Pass task context to agent command",
+      "status": "todo",
+      "acceptance": [
+        "Agent receives current task id, title, and acceptance criteria",
+        "Agent receives instruction to write task_update.json",
+        "Prompt is composed dynamically, not hardcoded in config"
+      ],
+      "notes": "Currently execute_agent runs the raw command. Need to inject task context."
+    },
+    {
+      "id": "task-update-parsing",
+      "title": "Parse task_update.json from agent output",
+      "status": "todo",
+      "acceptance": [
+        "After agent runs, check for .ralpher/task_update.json",
+        "Parse task_id, new_status, notes fields",
+        "Update task status in ralpher.prd.json",
+        "Emit TaskStatusChanged event"
+      ],
+      "notes": "Per tech.md section 5, agent writes task_update.json to report progress."
+    },
+    {
+      "id": "checkpoint-commits",
+      "title": "Commit checkpoint after successful iteration",
+      "status": "todo",
+      "acceptance": [
+        "After validators pass, commit all changes",
+        "Commit message format: ralpher: it<N> task <id> - <title>",
+        "Update run.last_checkpoint with new SHA",
+        "Emit CheckpointCreated event"
+      ],
+      "notes": "WorkspaceManager.checkpoint() exists but not wired into iteration flow."
+    },
+    {
+      "id": "validator-execution",
+      "title": "Execute validator commands",
+      "status": "todo",
+      "acceptance": [
+        "Run configured validators after agent completes",
+        "Capture exit codes and output",
+        "Emit ValidatorResult events",
+        "Validators passing required for checkpoint"
+      ],
+      "notes": "Validators are commands like 'cargo test'. Config schema may need validators field."
+    },
+    {
+      "id": "policy-engine",
+      "title": "Implement policy engine for diff checking",
+      "status": "todo",
+      "acceptance": [
+        "After agent runs, compute git diff --name-status",
+        "Check for policy violations (deletes, renames by default)",
+        "Support allow/deny path patterns in config",
+        "Emit PolicyViolation events on violation",
+        "Configurable action on violation: abort, reset, or keep"
+      ],
+      "notes": "Per tech.md section 7. Protects against unwanted changes."
+    },
+    {
+      "id": "iteration-loop",
+      "title": "Run iterations until completion or budget",
+      "status": "todo",
+      "acceptance": [
+        "ralpher continue runs multiple iterations, not just one",
+        "Stop when all tasks done or max_iterations reached",
+        "Stop on policy violation (configurable)",
+        "Support pause via signal or future TUI control"
+      ],
+      "notes": "Currently runs exactly one iteration per command invocation."
+    },
+    {
+      "id": "tui-basic",
+      "title": "Basic TUI with progress display",
+      "status": "todo",
+      "acceptance": [
+        "Show current run state, iteration count, elapsed time",
+        "Show task list with status indicators",
+        "Show current task details",
+        "Show progress percentage",
+        "Live update from events.ndjson"
+      ],
+      "notes": "Use ratatui + crossterm. Read events for live updates."
+    },
+    {
+      "id": "tui-log-panel",
+      "title": "TUI log panel for agent/validator output",
+      "status": "todo",
+      "acceptance": [
+        "Bottom panel shows live log tail",
+        "Toggle between agent and validator logs",
+        "Scroll through log history"
+      ],
+      "notes": "Key 'l' to toggle log source per tech.md."
+    },
+    {
+      "id": "tui-controls",
+      "title": "TUI keybindings for pause/abort/skip",
+      "status": "todo",
+      "acceptance": [
+        "Space to pause/resume",
+        "a to abort",
+        "s to skip current task",
+        "q to quit",
+        "Actions emit appropriate events"
+      ],
+      "notes": "Per tech.md section 3 keybindings."
+    }
+  ]
+}
