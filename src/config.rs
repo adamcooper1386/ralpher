@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 const CONFIG_FILE_NAME: &str = "ralpher.toml";
 
 /// Git operation mode for checkpointing.
-#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum GitMode {
     /// Create a dedicated branch for the run (safe default).
@@ -26,7 +26,7 @@ pub struct AgentConfig {
 }
 
 /// Top-level ralpher configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     /// Git mode for checkpointing.
     #[serde(default)]

@@ -37,7 +37,7 @@ pub struct Task {
 }
 
 /// A collection of PRD tasks with persistence and query methods.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct TaskList {
     /// The tasks in this PRD.
     pub tasks: Vec<Task>,
@@ -47,6 +47,11 @@ pub struct TaskList {
 }
 
 impl TaskList {
+    /// Create a new task list from a vector of tasks.
+    pub fn new(tasks: Vec<Task>) -> Self {
+        Self { tasks, path: None }
+    }
+
     /// Load a task list from the given directory.
     /// Looks for `ralpher.prd.json` in the directory.
     pub fn load(dir: &Path) -> Result<Self> {
