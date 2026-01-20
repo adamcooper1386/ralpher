@@ -51,3 +51,21 @@ Track what was accomplished in each development iteration.
 - Added `generate_run_id()` function
 - Added 9 unit tests for event module
 - All checks pass: fmt, clippy, test (25 total tests)
+
+## Iteration 5
+
+- Created workspace module (`src/workspace.rs`) for git operations
+- Added `WorkspaceManager` struct with repo path, git mode, and run branch tracking
+- Implemented git operations:
+  - `is_dirty()` - detect uncommitted changes via `git status --porcelain`
+  - `current_branch()` - get current branch name
+  - `head_sha()` - get short HEAD commit SHA
+  - `create_branch()` - create `ralpher/<run_id>` branch (branch mode only)
+  - `checkpoint()` - commit with message format `ralpher: it<N> task <id> - <title>`
+  - `diff_name_status()` - get file changes since a commit
+  - `unstaged_changes()` - get working tree changes
+  - `reset_hard()` - discard all changes and clean untracked files
+  - `is_git_repo()` - static method to check if path is a git repo
+- Added `FileChange` struct and `ChangeType` enum for diff parsing
+- Added 13 unit tests for workspace module
+- All checks pass: fmt, clippy, test (38 total tests)
