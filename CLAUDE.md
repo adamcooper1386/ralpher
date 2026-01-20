@@ -39,12 +39,44 @@ Run after every change:
 cargo fmt && cargo check && cargo clippy -- -D warnings && cargo test
 ```
 
+## Integration Tests (bintest)
+
+CLI behavior is tested using [bintest](https://github.com/cortesi/bintest) - a declarative YAML-based test runner for executables. Tests live in `tests/*.bintest.yaml`.
+
+```bash
+cargo build --release            # Build binary first
+bintest run tests/               # Run all integration tests
+bintest run tests/ --filter X    # Run tests matching X
+```
+
+**Test organization:**
+- Each feature gets its own file for parallel execution and sandbox isolation
+- Files that write config files should be isolated (one config scenario per file)
+- Tests within a file share a sandbox, so "no config" tests must be in their own file
+
+**What to test with bintest:**
+- CLI argument parsing and help output
+- Config file loading and validation
+- Error messages and exit codes
+- Command behavior (continue, start, status, validate, abort, clean)
+
+**What NOT to test with bintest:**
+- TUI rendering and interaction (use unit tests or manual testing)
+- Long-running processes
+
+**Adding new tests:**
+1. Create `tests/<feature>.bintest.yaml`
+2. Use `binary: ../target/release/ralpher` at suite level
+3. Reference binary as `${BINARY}` in commands
+4. Use `setup: write_file` to create test fixtures
+
 ## Before Committing
 
 All of these must pass with **zero warnings**:
 - `cargo fmt --check`
 - `cargo clippy -- -D warnings`
 - `cargo test`
+- `bintest run tests/` (requires `cargo build --release` first)
 
 ## Architecture Overview
 
@@ -59,6 +91,7 @@ Core components (from tech.md):
 Key directories:
 - `.ralpher/` - Runtime artifacts (run.json, events.ndjson, iterations/)
 - `product/` - PRD and technical documentation
+- `tests/` - Integration tests (bintest YAML specs)
 
 ## Key Libraries
 
