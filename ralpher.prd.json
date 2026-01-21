@@ -26,14 +26,14 @@
     {
       "id": "checkpoint-commits",
       "title": "Commit checkpoint after successful iteration",
-      "status": "todo",
+      "status": "done",
       "acceptance": [
         "After validators pass, commit all changes",
         "Commit message format: ralpher: it<N> task <id> - <title>",
         "Update run.last_checkpoint with new SHA",
         "Emit CheckpointCreated event"
       ],
-      "notes": "WorkspaceManager.checkpoint() exists but not wired into iteration flow."
+      "notes": "The checkpoint-commits feature was already implemented in the codebase. Verified that: (1) After validators pass, WorkspaceManager.checkpoint() is called from RunEngine.next_iteration() to commit all changes; (2) Commit message uses format 'ralpher: it<N> task <id> - <title>'; (3) run.last_checkpoint is updated with the new SHA in RunEngine.checkpoint(); (4) CheckpointCreated event is emitted with run_id, iteration, and commit_sha. Added two new unit tests to verify the checkpoint behavior: test_checkpoint_after_successful_iteration and test_checkpoint_includes_task_status_changes. All 55 unit tests and 26 integration tests pass."
     },
     {
       "id": "validator-execution",

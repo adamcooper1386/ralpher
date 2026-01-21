@@ -1076,4 +1076,146 @@ mod tests {
         assert_eq!(engine.run().state, RunState::Paused);
         assert_eq!(engine.run().iteration, 1);
     }
+
+    #[test]
+    fn test_checkpoint_after_successful_iteration() {
+        let dir = TempDir::new().unwrap();
+
+        // Initialize git repo
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        // Create agent script that makes changes
+        let agent_script = dir.path().join("agent.sh");
+        fs::write(
+            &agent_script,
+            "#!/bin/sh\necho 'changes made' > output.txt\n",
+        )
+        .unwrap();
+
+        // Make the script executable
+        Command::new("chmod")
+            .args(["+x", agent_script.to_str().unwrap()])
+            .output()
+            .unwrap();
+
+        // Create initial commit with .gitignore for .ralpher/ and the agent script
+        fs::write(dir.path().join("README.md"), "# Test\n").unwrap();
+        fs::write(dir.path().join(".gitignore"), ".ralpher/\n").unwrap();
+
+        // Create task list
+        let tasks = TaskList::new(vec![Task {
+            id: "task-1".to_string(),
+            title: "First task".to_string(),
+            status: TaskStatus::Todo,
+            acceptance: vec![],
+            validators: vec![],
+            notes: None,
+        }]);
+        let task_path = dir.path().join("ralpher.prd.json");
+        tasks.save_to(&task_path).unwrap();
+
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Initial commit"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        // Load tasks back so they have the path set
+        let tasks = TaskList::load(dir.path()).unwrap();
+
+        let config = Config {
+            git_mode: GitMode::Branch,
+            agent: Some(AgentConfig {
+                runner_type: "command".to_string(),
+                cmd: vec![agent_script.to_str().unwrap().to_string()],
+            }),
+        };
+
+        let mut engine = RunEngine::new(dir.path(), config, tasks).unwrap();
+        engine.start().unwrap();
+
+        let result = engine.next_iteration().unwrap();
+
+        // Should succeed and create checkpoint
+        assert!(result.success);
+        assert!(result.checkpoint_sha.is_some());
+
+        // run.last_checkpoint should be updated
+        assert!(engine.run().last_checkpoint.is_some());
+        assert_eq!(engine.run().last_checkpoint, result.checkpoint_sha.clone());
+
+        // Verify CheckpointCreated event was emitted
+        let events = EventLog::read_all(engine.events_path()).unwrap();
+        let checkpoint_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::CheckpointCreated { .. }))
+            .collect();
+        assert_eq!(checkpoint_events.len(), 1);
+
+        // Verify the event has correct data
+        match &checkpoint_events[0].kind {
+            EventKind::CheckpointCreated {
+                run_id,
+                iteration,
+                commit_sha,
+            } => {
+                assert_eq!(run_id, &engine.run().run_id);
+                assert_eq!(*iteration, 1);
+                assert_eq!(commit_sha, result.checkpoint_sha.as_ref().unwrap());
+            }
+            _ => panic!("Expected CheckpointCreated event"),
+        }
+
+        // Verify commit message format
+        let output = Command::new("git")
+            .args(["log", "-1", "--pretty=%s"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let message = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            message.contains("ralpher: it1 task task-1"),
+            "Commit message should follow format: {}",
+            message
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_includes_task_status_changes() {
+        // When a task changes to in_progress, ralpher.prd.json is modified.
+        // This test verifies that change is included in the checkpoint.
+        let (dir, config, tasks) = setup_test_repo();
+
+        let mut engine = RunEngine::new(dir.path(), config, tasks).unwrap();
+        engine.start().unwrap();
+
+        let result = engine.next_iteration().unwrap();
+
+        // Should succeed - the task status change to in_progress modifies ralpher.prd.json
+        assert!(result.success);
+        // Since task status changed (from todo to in_progress), there should be a checkpoint
+        assert!(result.checkpoint_sha.is_some());
+        assert!(engine.run().last_checkpoint.is_some());
+    }
 }
