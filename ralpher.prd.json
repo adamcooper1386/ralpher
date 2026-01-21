@@ -3,13 +3,13 @@
     {
       "id": "prompt-composition",
       "title": "Pass task context to agent command",
-      "status": "todo",
+      "status": "done",
       "acceptance": [
         "Agent receives current task id, title, and acceptance criteria",
         "Agent receives instruction to write task_update.json",
         "Prompt is composed dynamically, not hardcoded in config"
       ],
-      "notes": "Currently execute_agent runs the raw command. Need to inject task context."
+      "notes": "Task was already implemented. The compose_prompt method in run.rs creates dynamic prompts with task id, title, acceptance criteria, and instructions to write task_update.json. The execute_agent method passes this prompt via -p flag. All checks pass (fmt, check, clippy, 53 tests)."
     },
     {
       "id": "task-update-parsing",
