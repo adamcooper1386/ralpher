@@ -12,14 +12,15 @@ use tracing_subscriber::EnvFilter;
 const RALPHER_DIR: &str = ".ralpher";
 
 fn main() -> Result<()> {
-    // Initialize tracing with WARN as default, respecting RUST_LOG
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
-        )
-        .init();
-
     let cli = Cli::parse();
+
+    // Initialize tracing: CLI flag > RUST_LOG > default (warn)
+    let filter = if let Some(ref level) = cli.log_level {
+        EnvFilter::new(level)
+    } else {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"))
+    };
+    tracing_subscriber::fmt().with_env_filter(filter).init();
     let cwd = env::current_dir()?;
 
     debug!(?cli.command, "parsed CLI arguments");

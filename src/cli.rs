@@ -5,6 +5,10 @@ use clap::{Parser, Subcommand};
 #[command(name = "ralpher")]
 #[command(version, about, long_about = None)]
 pub struct Cli {
+    /// Set the log level (trace, debug, info, warn, error)
+    #[arg(long, global = true, value_name = "LEVEL")]
+    pub log_level: Option<String>,
+
     #[command(subcommand)]
     pub command: Command,
 }
