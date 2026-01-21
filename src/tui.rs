@@ -34,6 +34,21 @@ pub enum LogSource {
     Validator,
 }
 
+/// Actions that can be triggered from the TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiAction {
+    /// Pause the current run.
+    Pause,
+    /// Resume a paused run.
+    Resume,
+    /// Abort the current run.
+    Abort,
+    /// Skip the current task.
+    Skip,
+    /// Quit the TUI (pause if running).
+    Quit,
+}
+
 /// TUI application state.
 pub struct App {
     /// Path to the repository root.
@@ -60,6 +75,10 @@ pub struct App {
     log_file_pos: u64,
     /// Scroll offset for log panel (0 = at bottom/most recent).
     log_scroll_offset: usize,
+    /// Pending action to be executed by the engine.
+    pending_action: Option<TuiAction>,
+    /// Time of last user interaction (for auto-iteration when idle).
+    last_interaction: Instant,
 }
 
 impl App {
@@ -78,7 +97,40 @@ impl App {
             log_lines: Vec::new(),
             log_file_pos: 0,
             log_scroll_offset: 0,
+            pending_action: None,
+            last_interaction: Instant::now(),
         }
+    }
+
+    /// Mark that user interacted (resets idle timer).
+    pub fn touch(&mut self) {
+        self.last_interaction = Instant::now();
+    }
+
+    /// Check if user has been idle for the given duration.
+    pub fn is_idle_for(&self, duration: Duration) -> bool {
+        self.last_interaction.elapsed() > duration
+    }
+
+    /// Get the current run state.
+    pub fn run_state(&self) -> Option<RunState> {
+        self.run.as_ref().map(|r| r.state)
+    }
+
+    /// Request a control action.
+    /// The action will be picked up by the main loop.
+    pub fn request_action(&mut self, action: TuiAction) {
+        self.pending_action = Some(action);
+    }
+
+    /// Take the pending action (if any), clearing it.
+    pub fn take_action(&mut self) -> Option<TuiAction> {
+        self.pending_action.take()
+    }
+
+    /// Check if there's a pending action.
+    pub fn has_pending_action(&self) -> bool {
+        self.pending_action.is_some()
     }
 
     /// Path to the events file.
@@ -344,8 +396,13 @@ impl App {
     }
 }
 
-/// Run the TUI.
-pub fn run_tui(repo_path: impl AsRef<Path>, run: Option<Run>, tasks: TaskList) -> Result<()> {
+/// Run the TUI and return any action requested by the user.
+/// Returns None if the user quit without requesting an action.
+pub fn run_tui(
+    repo_path: impl AsRef<Path>,
+    run: Option<Run>,
+    tasks: TaskList,
+) -> Result<Option<TuiAction>> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -373,10 +430,50 @@ pub fn run_tui(repo_path: impl AsRef<Path>, run: Option<Run>, tasks: TaskList) -
         if event::poll(timeout)?
             && let CrosstermEvent::Key(key) = event::read()?
         {
+            // Mark user interaction to reset idle timer
+            app.touch();
+
             match key.code {
-                KeyCode::Char('q') => app.should_quit = true,
+                KeyCode::Char('q') => {
+                    // Quit: if running, pause first
+                    if app.run_state() == Some(RunState::Running) {
+                        app.request_action(TuiAction::Pause);
+                    }
+                    app.request_action(TuiAction::Quit);
+                    app.should_quit = true;
+                }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.should_quit = true
+                    if app.run_state() == Some(RunState::Running) {
+                        app.request_action(TuiAction::Pause);
+                    }
+                    app.request_action(TuiAction::Quit);
+                    app.should_quit = true;
+                }
+                KeyCode::Char(' ') => {
+                    // Space: toggle pause/resume
+                    match app.run_state() {
+                        Some(RunState::Running) => app.request_action(TuiAction::Pause),
+                        Some(RunState::Paused) => app.request_action(TuiAction::Resume),
+                        _ => {} // No action for other states
+                    }
+                }
+                KeyCode::Char('a') => {
+                    // Abort: only if not in terminal state
+                    match app.run_state() {
+                        Some(RunState::Running) | Some(RunState::Paused) => {
+                            app.request_action(TuiAction::Abort);
+                        }
+                        _ => {}
+                    }
+                }
+                KeyCode::Char('s') => {
+                    // Skip: only if running or paused
+                    match app.run_state() {
+                        Some(RunState::Running) | Some(RunState::Paused) => {
+                            app.request_action(TuiAction::Skip);
+                        }
+                        _ => {}
+                    }
                 }
                 KeyCode::Char('r') => app.refresh(),
                 KeyCode::Char('l') => app.toggle_log_source(),
@@ -398,17 +495,29 @@ pub fn run_tui(repo_path: impl AsRef<Path>, run: Option<Run>, tasks: TaskList) -
             last_tick = Instant::now();
         }
 
-        if app.should_quit {
+        // Exit if quitting or if there's a pending action to process
+        if app.should_quit || app.has_pending_action() {
+            break;
+        }
+
+        // If the run is in Running state and user is idle, exit to run an iteration.
+        // This allows the TUI to display progress while iterations proceed automatically.
+        // User interaction resets the idle timer, so scrolling/reading won't interrupt.
+        if app.run_state() == Some(RunState::Running) && app.is_idle_for(Duration::from_millis(500))
+        {
             break;
         }
     }
+
+    // Capture the pending action before cleaning up
+    let action = app.take_action();
 
     // Restore terminal
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    Ok(())
+    Ok(action)
 }
 
 /// Draw the TUI.
@@ -687,16 +796,61 @@ fn draw_footer(f: &mut ratatui::Frame, app: &App, area: Rect) {
         LogSource::Validator => "Agent",
     };
 
-    let footer = Paragraph::new(Line::from(vec![
+    // Build control hints based on run state
+    let mut spans = vec![
         Span::styled(" q ", Style::default().add_modifier(Modifier::REVERSED)),
         Span::raw(" Quit  "),
-        Span::styled(" r ", Style::default().add_modifier(Modifier::REVERSED)),
-        Span::raw(" Refresh  "),
-        Span::styled(" l ", Style::default().add_modifier(Modifier::REVERSED)),
-        Span::raw(format!(" {} Log  ", log_toggle_hint)),
-        Span::styled(" j/k ", Style::default().add_modifier(Modifier::REVERSED)),
-        Span::raw(" Scroll  "),
-    ]));
+    ];
+
+    // Add pause/resume based on state
+    match app.run_state() {
+        Some(RunState::Running) => {
+            spans.push(Span::styled(
+                " ␣ ",
+                Style::default().add_modifier(Modifier::REVERSED),
+            ));
+            spans.push(Span::raw(" Pause  "));
+        }
+        Some(RunState::Paused) => {
+            spans.push(Span::styled(
+                " ␣ ",
+                Style::default().add_modifier(Modifier::REVERSED),
+            ));
+            spans.push(Span::raw(" Resume  "));
+        }
+        _ => {}
+    }
+
+    // Add abort and skip for active runs
+    match app.run_state() {
+        Some(RunState::Running) | Some(RunState::Paused) => {
+            spans.push(Span::styled(
+                " a ",
+                Style::default().add_modifier(Modifier::REVERSED),
+            ));
+            spans.push(Span::raw(" Abort  "));
+            spans.push(Span::styled(
+                " s ",
+                Style::default().add_modifier(Modifier::REVERSED),
+            ));
+            spans.push(Span::raw(" Skip  "));
+        }
+        _ => {}
+    }
+
+    // Navigation controls
+    spans.push(Span::styled(
+        " l ",
+        Style::default().add_modifier(Modifier::REVERSED),
+    ));
+    spans.push(Span::raw(format!(" {} Log  ", log_toggle_hint)));
+    spans.push(Span::styled(
+        " j/k ",
+        Style::default().add_modifier(Modifier::REVERSED),
+    ));
+    spans.push(Span::raw(" Scroll  "));
+
+    let footer = Paragraph::new(Line::from(spans));
 
     f.render_widget(footer, area);
 }
@@ -950,5 +1104,42 @@ mod tests {
         assert!(app.log_lines.is_empty());
         assert_eq!(app.log_file_pos, 0);
         assert_eq!(app.log_scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_request_action() {
+        let dir = TempDir::new().unwrap();
+        let tasks = TaskList::new(vec![]);
+        let mut app = App::new(dir.path(), None, tasks);
+
+        assert!(!app.has_pending_action());
+
+        app.request_action(TuiAction::Pause);
+
+        assert!(app.has_pending_action());
+        assert_eq!(app.take_action(), Some(TuiAction::Pause));
+        assert!(!app.has_pending_action());
+    }
+
+    #[test]
+    fn test_run_state() {
+        let dir = TempDir::new().unwrap();
+        let tasks = TaskList::new(vec![]);
+
+        // No run - should return None
+        let app = App::new(dir.path(), None, tasks.clone());
+        assert!(app.run_state().is_none());
+
+        // Running run
+        let mut run = Run::new("run-1".to_string(), crate::config::GitMode::Branch);
+        run.state = RunState::Running;
+        let app = App::new(dir.path(), Some(run), tasks.clone());
+        assert_eq!(app.run_state(), Some(RunState::Running));
+
+        // Paused run
+        let mut run = Run::new("run-2".to_string(), crate::config::GitMode::Branch);
+        run.state = RunState::Paused;
+        let app = App::new(dir.path(), Some(run), tasks);
+        assert_eq!(app.run_state(), Some(RunState::Paused));
     }
 }

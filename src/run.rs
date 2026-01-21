@@ -1028,6 +1028,60 @@ impl RunEngine {
         Ok(())
     }
 
+    /// Skip the current task by marking it as blocked.
+    /// Returns the task ID that was skipped, or None if no current task.
+    pub fn skip_task(&mut self, reason: &str) -> Result<Option<String>> {
+        debug!(run_id = %self.run.run_id, "skipping current task");
+
+        let task_id = match self.run.current_task_id.clone() {
+            Some(id) => id,
+            None => {
+                info!("no current task to skip");
+                return Ok(None);
+            }
+        };
+
+        // Get the task and update its status
+        let task = self
+            .tasks
+            .get_mut(&task_id)
+            .context("Current task not found in task list")?;
+
+        let old_status = task.status;
+        task.status = TaskStatus::Blocked;
+        task.notes = Some(format!(
+            "Skipped: {}{}",
+            reason,
+            task.notes
+                .as_ref()
+                .map(|n| format!(" (was: {})", n))
+                .unwrap_or_default()
+        ));
+
+        info!(
+            task_id = %task_id,
+            old_status = ?old_status,
+            "task skipped"
+        );
+
+        // Emit TaskStatusChanged event
+        self.event_log.emit_now(EventKind::TaskStatusChanged {
+            run_id: self.run.run_id.clone(),
+            task_id: task_id.clone(),
+            old_status,
+            new_status: TaskStatus::Blocked,
+        })?;
+
+        // Save task list
+        self.tasks.save()?;
+
+        // Clear current task so next iteration picks the next one
+        self.run.current_task_id = None;
+        self.run.save(&self.repo_path)?;
+
+        Ok(Some(task_id))
+    }
+
     /// Mark the run as completed.
     fn complete(&mut self) -> Result<()> {
         debug!(run_id = %self.run.run_id, "completing run");
@@ -1900,5 +1954,127 @@ mod tests {
         // Should pass because deletion is in allowed path
         assert!(result.policy_passed);
         assert!(result.success);
+    }
+
+    #[test]
+    fn test_skip_task() {
+        let (dir, config, tasks) = setup_test_repo();
+        let mut engine = RunEngine::new(dir.path(), config, tasks).unwrap();
+
+        engine.start().unwrap();
+
+        // Run one iteration to set current task
+        engine.next_iteration().unwrap();
+
+        // Skip the current task
+        let skipped = engine.skip_task("test skip reason").unwrap();
+
+        assert!(skipped.is_some());
+        assert_eq!(skipped.unwrap(), "task-1");
+
+        // Task should be blocked
+        let task = engine
+            .tasks()
+            .tasks
+            .iter()
+            .find(|t| t.id == "task-1")
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Blocked);
+        assert!(
+            task.notes
+                .as_ref()
+                .unwrap()
+                .contains("Skipped: test skip reason")
+        );
+
+        // current_task_id should be cleared
+        assert!(engine.run().current_task_id.is_none());
+    }
+
+    #[test]
+    fn test_skip_task_no_current() {
+        let dir = TempDir::new().unwrap();
+
+        // Initialize git repo
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        // Create initial commit
+        fs::write(dir.path().join("README.md"), "# Test\n").unwrap();
+        fs::write(dir.path().join(".gitignore"), ".ralpher/\n").unwrap();
+
+        // Empty task list
+        let tasks = TaskList::new(vec![]);
+        let task_path = dir.path().join("ralpher.prd.json");
+        tasks.save_to(&task_path).unwrap();
+
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Initial commit"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let tasks = TaskList::load(dir.path()).unwrap();
+        let config = Config {
+            git_mode: GitMode::Branch,
+            agent: None,
+            validators: vec![],
+            policy: crate::policy::PolicyConfig::permissive(),
+            ..Config::default()
+        };
+
+        let mut engine = RunEngine::new(dir.path(), config, tasks).unwrap();
+        engine.start().unwrap();
+
+        // Skip with no current task
+        let skipped = engine.skip_task("no task").unwrap();
+
+        assert!(skipped.is_none());
+    }
+
+    #[test]
+    fn test_skip_task_emits_event() {
+        let (dir, config, tasks) = setup_test_repo();
+        let mut engine = RunEngine::new(dir.path(), config, tasks).unwrap();
+
+        engine.start().unwrap();
+        engine.next_iteration().unwrap();
+
+        // Skip the current task
+        engine.skip_task("test reason").unwrap();
+
+        // Read events back
+        let events = EventLog::read_all(engine.events_path()).unwrap();
+
+        // Find TaskStatusChanged event for the skip
+        let skip_event = events.iter().find(|e| {
+            matches!(
+                &e.kind,
+                EventKind::TaskStatusChanged {
+                    new_status: TaskStatus::Blocked,
+                    ..
+                }
+            )
+        });
+
+        assert!(skip_event.is_some());
     }
 }

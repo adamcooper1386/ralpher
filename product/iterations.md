@@ -111,3 +111,35 @@ Track what was accomplished in each development iteration.
 - Graceful error handling when agent config is missing
 - Updated test fixtures to configure a simple agent (`true` command)
 - All checks pass: fmt, clippy, test (53 unit tests), bintest (26 integration tests)
+
+## Iteration 8
+
+- Implemented TUI log panel for agent/validator output
+- Added `LogSource` enum to toggle between agent and validator logs
+- Bottom panel shows live log tail with:
+  - Incremental file reading for agent logs
+  - JSON parsing and formatting for validator results
+  - Color-coded output (errors=red, warnings=yellow, pass=green)
+- Added log scrolling with j/k/PageUp/PageDown/Home/End
+- Added 'l' key to toggle between agent and validator log views
+- Added tests for log loading and scrolling
+- All checks pass: fmt, clippy, test, bintest
+
+## Iteration 9
+
+- Implemented TUI keybindings for pause/abort/skip controls
+- Added `TuiAction` enum with variants: Pause, Resume, Abort, Skip, Quit
+- Added keybindings:
+  - Space: toggle pause/resume (context-aware based on run state)
+  - 'a': abort the current run
+  - 's': skip current task (marks as blocked)
+  - 'q': quit TUI (pauses if running)
+- Added `skip_task()` method to RunEngine:
+  - Marks current task as Blocked with reason
+  - Emits TaskStatusChanged event
+  - Clears current_task_id so next iteration picks next task
+- Integrated TUI with engine via `run_with_tui()` function
+- Added `--headless` flag to continue/start commands for non-TUI mode
+- Dynamic footer shows available controls based on run state
+- Added 6 new unit tests for skip_task and TuiAction
+- All checks pass: fmt, clippy, test (101 unit tests), bintest (29 integration tests)

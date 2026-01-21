@@ -24,6 +24,10 @@ pub enum Command {
         /// Stop after the current task completes (for reviewing changes)
         #[arg(long)]
         task: bool,
+
+        /// Run without TUI (headless mode with log output only)
+        #[arg(long)]
+        headless: bool,
     },
 
     /// Start a new run explicitly (fails if a run is already in progress)
@@ -35,6 +39,10 @@ pub enum Command {
         /// Stop after the current task completes (for reviewing changes)
         #[arg(long)]
         task: bool,
+
+        /// Run without TUI (headless mode with log output only)
+        #[arg(long)]
+        headless: bool,
     },
 
     /// Show current run status without launching TUI

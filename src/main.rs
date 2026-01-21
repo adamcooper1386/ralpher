@@ -4,6 +4,7 @@ use ralpher::cli::{Cli, Command};
 use ralpher::config::Config;
 use ralpher::run::{Run, RunEngine, RunState, run_validators_standalone};
 use ralpher::task::{TaskList, TaskStatus};
+use ralpher::tui::{TuiAction, run_tui};
 use std::env;
 use std::path::Path;
 use std::sync::Arc;
@@ -47,8 +48,16 @@ fn main() -> Result<()> {
     debug!(?cli.command, "parsed CLI arguments");
 
     match cli.command {
-        Command::Continue { once, task } => cmd_continue(&cwd, once, task)?,
-        Command::Start { once, task } => cmd_start(&cwd, once, task)?,
+        Command::Continue {
+            once,
+            task,
+            headless,
+        } => cmd_continue(&cwd, once, task, headless)?,
+        Command::Start {
+            once,
+            task,
+            headless,
+        } => cmd_start(&cwd, once, task, headless)?,
         Command::Status => cmd_status(&cwd)?,
         Command::Validate => cmd_validate(&cwd)?,
         Command::Abort => cmd_abort(&cwd)?,
@@ -59,7 +68,7 @@ fn main() -> Result<()> {
 }
 
 /// Continue an existing run or start a new one.
-fn cmd_continue(cwd: &Path, once: bool, task: bool) -> Result<()> {
+fn cmd_continue(cwd: &Path, once: bool, task: bool, headless: bool) -> Result<()> {
     let (config, _) = Config::load(cwd)?;
     let tasks = TaskList::load(cwd)?;
 
@@ -94,8 +103,10 @@ fn cmd_continue(cwd: &Path, once: bool, task: bool) -> Result<()> {
         // Run iterations
         if once {
             run_single_iteration(&mut engine)?;
-        } else {
+        } else if headless {
             run_iterations(&mut engine, task)?;
+        } else {
+            run_with_tui(cwd, &mut engine, task)?;
         }
     } else {
         // No existing run, start a new one
@@ -111,8 +122,10 @@ fn cmd_continue(cwd: &Path, once: bool, task: bool) -> Result<()> {
         // Run iterations
         if once {
             run_single_iteration(&mut engine)?;
-        } else {
+        } else if headless {
             run_iterations(&mut engine, task)?;
+        } else {
+            run_with_tui(cwd, &mut engine, task)?;
         }
     }
 
@@ -120,7 +133,7 @@ fn cmd_continue(cwd: &Path, once: bool, task: bool) -> Result<()> {
 }
 
 /// Start a new run explicitly.
-fn cmd_start(cwd: &Path, once: bool, task: bool) -> Result<()> {
+fn cmd_start(cwd: &Path, once: bool, task: bool, headless: bool) -> Result<()> {
     let (config, _) = Config::load(cwd)?;
     let tasks = TaskList::load(cwd)?;
 
@@ -157,8 +170,10 @@ fn cmd_start(cwd: &Path, once: bool, task: bool) -> Result<()> {
     // Run iterations
     if once {
         run_single_iteration(&mut engine)?;
-    } else {
+    } else if headless {
         run_iterations(&mut engine, task)?;
+    } else {
+        run_with_tui(cwd, &mut engine, task)?;
     }
 
     Ok(())
@@ -427,6 +442,123 @@ fn run_iterations(engine: &mut RunEngine, stop_on_task_complete: bool) -> Result
                 engine.pause()?;
                 break;
             }
+        }
+    }
+
+    Ok(())
+}
+
+/// Run with TUI control.
+/// The TUI displays state and allows user to control the run via keybindings.
+fn run_with_tui(cwd: &Path, engine: &mut RunEngine, stop_on_task_complete: bool) -> Result<()> {
+    let max_iterations = engine.config().max_iterations;
+
+    loop {
+        // Reload current state from disk for TUI
+        let run = Run::load(cwd)?.unwrap_or_else(|| engine.run().clone());
+        let tasks = TaskList::load(cwd)?;
+
+        // Check if already in terminal state
+        if run.state.is_terminal() {
+            // Show final state in TUI briefly
+            let _ = run_tui(cwd, Some(run.clone()), tasks);
+            break;
+        }
+
+        // Launch TUI - it will return when user requests an action or quits
+        let action = run_tui(cwd, Some(run.clone()), tasks)?;
+
+        match action {
+            Some(TuiAction::Quit) => {
+                // User quit - just exit
+                break;
+            }
+            Some(TuiAction::Pause) => {
+                if engine.run().state == RunState::Running {
+                    engine.pause()?;
+                    info!("run paused");
+                }
+            }
+            Some(TuiAction::Resume) => {
+                if engine.run().state == RunState::Paused {
+                    engine.resume()?;
+                    info!("run resumed");
+                    // Run one iteration after resuming
+                    run_tui_iteration(engine, stop_on_task_complete, max_iterations)?;
+                }
+            }
+            Some(TuiAction::Abort) => {
+                if !engine.run().state.is_terminal() {
+                    engine.abort("User requested abort via TUI")?;
+                    info!("run aborted");
+                }
+            }
+            Some(TuiAction::Skip) => {
+                if let Some(task_id) = engine.skip_task("User skipped via TUI")? {
+                    info!(task_id = %task_id, "task skipped");
+                }
+            }
+            None => {
+                // No action requested, but TUI exited - check if we should run an iteration
+                if engine.run().state == RunState::Running {
+                    run_tui_iteration(engine, stop_on_task_complete, max_iterations)?;
+                }
+            }
+        }
+
+        // Check if run finished
+        if engine.run().state.is_terminal() {
+            // Show final state
+            let run = Run::load(cwd)?.unwrap_or_else(|| engine.run().clone());
+            let tasks = TaskList::load(cwd)?;
+            let _ = run_tui(cwd, Some(run), tasks);
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+/// Run a single iteration with TUI controls (checks max iterations, handles failures).
+fn run_tui_iteration(
+    engine: &mut RunEngine,
+    stop_on_task_complete: bool,
+    max_iterations: u32,
+) -> Result<()> {
+    // Check iteration limit
+    if engine.run().iteration >= max_iterations {
+        warn!(max_iterations, "reached maximum iterations, pausing run");
+        engine.pause()?;
+        return Ok(());
+    }
+
+    // Track current task for --task behavior
+    let task_before = engine.run().current_task_id.clone();
+
+    // Run one iteration
+    let result = engine.next_iteration()?;
+
+    debug!(
+        iteration = engine.run().iteration,
+        success = result.success,
+        "iteration completed"
+    );
+
+    // Handle failure
+    if !result.success && engine.run().state == RunState::Running {
+        info!("iteration failed, pausing run");
+        engine.pause()?;
+    }
+
+    // Check if task changed and we should pause
+    if stop_on_task_complete {
+        let task_after = engine.tasks().current_task().map(|t| t.id.clone());
+        if task_before.is_some()
+            && task_after != task_before
+            && engine.run().state == RunState::Running
+        {
+            info!("task completed, pausing for review");
+            engine.pause()?;
         }
     }
 
