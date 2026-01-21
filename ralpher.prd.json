@@ -14,14 +14,14 @@
     {
       "id": "task-update-parsing",
       "title": "Parse task_update.json from agent output",
-      "status": "todo",
+      "status": "done",
       "acceptance": [
         "After agent runs, check for .ralpher/task_update.json",
         "Parse task_id, new_status, notes fields",
         "Update task status in ralpher.prd.json",
         "Emit TaskStatusChanged event"
       ],
-      "notes": "Per tech.md section 5, agent writes task_update.json to report progress."
+      "notes": "Task update parsing was already fully implemented in src/run.rs: TaskUpdate struct defined with task_id/new_status/notes fields, parse_task_update() parses .ralpher/task_update.json, next_iteration() updates task status in ralpher.prd.json and emits TaskStatusChanged event. All checks pass (53 unit tests, 26 integration tests)."
     },
     {
       "id": "checkpoint-commits",
