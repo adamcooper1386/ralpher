@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::policy::PolicyConfig;
+
 const CONFIG_FILE_NAME: &str = "ralpher.toml";
 
 /// Git operation mode for checkpointing.
@@ -37,6 +39,9 @@ pub struct Config {
     /// Each validator is a shell command string.
     #[serde(default)]
     pub validators: Vec<String>,
+    /// Policy configuration for diff checking.
+    #[serde(default)]
+    pub policy: PolicyConfig,
 }
 
 impl Config {
@@ -116,5 +121,33 @@ cmd = ["claude", "code", "--print"]
         let result = Config::load(dir.path());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No ralpher.toml"));
+    }
+
+    #[test]
+    fn test_load_config_with_policy() {
+        use crate::policy::ViolationAction;
+
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("ralpher.toml");
+        let mut file = std::fs::File::create(&config_path).unwrap();
+        writeln!(
+            file,
+            r#"
+[policy]
+deny_deletes = false
+deny_renames = true
+allow_paths = ["*.tmp", "test/**"]
+deny_paths = ["secrets/*"]
+on_violation = "reset"
+"#
+        )
+        .unwrap();
+
+        let (config, _) = Config::load(dir.path()).unwrap();
+        assert!(!config.policy.deny_deletes);
+        assert!(config.policy.deny_renames);
+        assert_eq!(config.policy.allow_paths, vec!["*.tmp", "test/**"]);
+        assert_eq!(config.policy.deny_paths, vec!["secrets/*"]);
+        assert_eq!(config.policy.on_violation, ViolationAction::Reset);
     }
 }

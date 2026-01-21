@@ -50,7 +50,7 @@
     {
       "id": "policy-engine",
       "title": "Implement policy engine for diff checking",
-      "status": "todo",
+      "status": "done",
       "acceptance": [
         "After agent runs, compute git diff --name-status",
         "Check for policy violations (deletes, renames by default)",
@@ -58,7 +58,7 @@
         "Emit PolicyViolation events on violation",
         "Configurable action on violation: abort, reset, or keep"
       ],
-      "notes": "Per tech.md section 7. Protects against unwanted changes."
+      "notes": "Implemented policy engine for diff checking with: deny_deletes/deny_renames by default, allow/deny path patterns with glob support, PolicyViolation events emitted on violations, configurable violation actions (abort/reset/keep). Added 31 new tests."
     },
     {
       "id": "iteration-loop",

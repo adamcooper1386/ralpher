@@ -9,6 +9,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::config::{Config, GitMode};
 use crate::event::{EventKind, EventLog, RunId, ValidatorStatus, generate_run_id};
+use crate::policy::{PolicyEngine, ViolationAction};
 use crate::task::{Task, TaskList, TaskStatus};
 use crate::workspace::WorkspaceManager;
 
@@ -174,12 +175,14 @@ impl Run {
 /// Result of a single iteration.
 #[derive(Debug, Clone)]
 pub struct IterationResult {
-    /// Whether the iteration succeeded (agent ran, validators passed).
+    /// Whether the iteration succeeded (agent ran, validators passed, policy passed).
     pub success: bool,
     /// Exit code from the agent command.
     pub agent_exit_code: Option<i32>,
     /// Whether validators passed.
     pub validators_passed: bool,
+    /// Whether policy checks passed.
+    pub policy_passed: bool,
     /// Commit SHA if a checkpoint was created.
     pub checkpoint_sha: Option<String>,
 }
@@ -198,6 +201,8 @@ pub struct RunEngine {
     workspace: WorkspaceManager,
     /// Event log for streaming events.
     event_log: EventLog,
+    /// Policy engine for diff checking.
+    policy_engine: PolicyEngine,
 }
 
 impl RunEngine {
@@ -212,6 +217,8 @@ impl RunEngine {
         let events_path = repo_path.join(RALPHER_DIR).join(EVENTS_FILE);
         let event_log = EventLog::open(&events_path)?;
 
+        let policy_engine = PolicyEngine::new(config.policy.clone());
+
         Ok(Self {
             repo_path,
             run,
@@ -219,6 +226,7 @@ impl RunEngine {
             tasks,
             workspace,
             event_log,
+            policy_engine,
         })
     }
 
@@ -240,6 +248,8 @@ impl RunEngine {
         let events_path = repo_path.join(RALPHER_DIR).join(EVENTS_FILE);
         let event_log = EventLog::open(&events_path)?;
 
+        let policy_engine = PolicyEngine::new(config.policy.clone());
+
         Ok(Some(Self {
             repo_path,
             run,
@@ -247,6 +257,7 @@ impl RunEngine {
             tasks,
             workspace,
             event_log,
+            policy_engine,
         }))
     }
 
@@ -349,6 +360,7 @@ impl RunEngine {
                     success: true,
                     agent_exit_code: None,
                     validators_passed: true,
+                    policy_passed: true,
                     checkpoint_sha: None,
                 });
             }
@@ -437,12 +449,50 @@ impl RunEngine {
         let validation_results = self.execute_validators(&task)?;
         let validators_passed = validation_results.all_passed;
 
+        // Check policy against changes (before checkpoint)
+        let policy_result = self.check_policy()?;
+        let policy_passed = policy_result.is_clean();
+
+        // Emit PolicyViolation events for any violations
+        for violation in &policy_result.violations {
+            self.event_log.emit_now(EventKind::PolicyViolation {
+                run_id: self.run.run_id.clone(),
+                iteration: self.run.iteration,
+                rule: violation.rule.clone(),
+                severity: violation.severity,
+                details: violation.details.clone(),
+            })?;
+        }
+
+        // Handle policy violations based on configured action
+        let should_checkpoint = if !policy_passed {
+            match self.policy_engine.violation_action() {
+                ViolationAction::Abort => {
+                    info!("policy violation with action=abort, aborting run");
+                    self.abort("Policy violation detected")?;
+                    false
+                }
+                ViolationAction::Reset => {
+                    info!("policy violation with action=reset, discarding changes");
+                    self.workspace.reset_hard()?;
+                    false
+                }
+                ViolationAction::Keep => {
+                    warn!("policy violation with action=keep, continuing with changes");
+                    true
+                }
+            }
+        } else {
+            true
+        };
+
         // Determine success and create checkpoint if appropriate
-        let success = agent_exit_code == Some(0) && validators_passed;
+        let success =
+            agent_exit_code == Some(0) && validators_passed && (policy_passed || should_checkpoint);
         let mut checkpoint_sha = None;
 
         // Create checkpoint if iteration was successful and there are changes
-        if success {
+        if success && should_checkpoint {
             // Check if there are any staged or unstaged changes to commit
             let has_changes = self.workspace.is_dirty().unwrap_or(false);
             trace!(has_changes, "checking for uncommitted changes");
@@ -486,6 +536,7 @@ impl RunEngine {
             success,
             agent_exit_code,
             validators_passed,
+            policy_passed,
             checkpoint_sha,
         })
     }
@@ -778,6 +829,86 @@ impl RunEngine {
         debug!(all_passed, "validation complete");
 
         Ok(validation_results)
+    }
+
+    /// Check policy against current working tree changes.
+    /// Gets the diff of uncommitted changes and checks against policy rules.
+    fn check_policy(&self) -> Result<crate::policy::PolicyCheckResult> {
+        use crate::policy::PolicyCheckResult;
+
+        // Get list of changes in the working tree (staged + unstaged)
+        // We need to check what the agent changed before we commit
+        let output = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&self.repo_path)
+            .output()
+            .context("Failed to run git status")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("git status failed: {}", stderr);
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut changes = Vec::new();
+
+        for line in stdout.lines() {
+            if line.len() < 3 {
+                continue;
+            }
+
+            // git status --porcelain format: XY filename
+            // X = index status, Y = worktree status
+            let status = &line[..2];
+            let path = line[3..].trim();
+
+            // Skip .ralpher/ directory
+            if path.starts_with(".ralpher/") {
+                continue;
+            }
+
+            // Parse the status codes
+            let change_type = match status.chars().next().unwrap_or(' ') {
+                'D' => crate::workspace::ChangeType::Deleted,
+                'R' => crate::workspace::ChangeType::Renamed,
+                'A' => crate::workspace::ChangeType::Added,
+                'M' | ' ' => {
+                    // Check worktree status for modifications
+                    match status.chars().nth(1).unwrap_or(' ') {
+                        'D' => crate::workspace::ChangeType::Deleted,
+                        'M' => crate::workspace::ChangeType::Modified,
+                        _ => crate::workspace::ChangeType::Modified,
+                    }
+                }
+                '?' => crate::workspace::ChangeType::Added, // Untracked
+                _ => crate::workspace::ChangeType::Modified,
+            };
+
+            // Handle renames (format: R  old -> new)
+            let (path, old_path) = if path.contains(" -> ") {
+                let parts: Vec<&str> = path.split(" -> ").collect();
+                (
+                    parts.get(1).unwrap_or(&path).to_string(),
+                    Some(parts.first().unwrap_or(&"").to_string()),
+                )
+            } else {
+                (path.to_string(), None)
+            };
+
+            changes.push(crate::workspace::FileChange {
+                change_type,
+                path,
+                old_path,
+            });
+        }
+
+        debug!(change_count = changes.len(), "checking policy");
+
+        if changes.is_empty() {
+            return Ok(PolicyCheckResult::default());
+        }
+
+        Ok(self.policy_engine.check(&changes))
     }
 
     /// Update a task's status and emit an event.
@@ -1093,6 +1224,7 @@ mod tests {
                 cmd: vec!["true".to_string()],
             }),
             validators: vec![],
+            policy: crate::policy::PolicyConfig::permissive(),
         };
 
         // Create task list with sample tasks and save to disk
@@ -1232,6 +1364,7 @@ mod tests {
             git_mode: GitMode::Trunk,
             agent: None,
             validators: vec![],
+            policy: crate::policy::PolicyConfig::permissive(),
         };
         let mut engine = RunEngine::new(dir.path(), config, tasks).unwrap();
 
@@ -1418,6 +1551,7 @@ mod tests {
                 cmd: vec![agent_script.to_str().unwrap().to_string()],
             }),
             validators: vec![],
+            policy: crate::policy::PolicyConfig::permissive(),
         };
 
         let mut engine = RunEngine::new(dir.path(), config, tasks).unwrap();
@@ -1427,6 +1561,7 @@ mod tests {
 
         // Should succeed and create checkpoint
         assert!(result.success);
+        assert!(result.policy_passed);
         assert!(result.checkpoint_sha.is_some());
 
         // run.last_checkpoint should be updated
@@ -1603,6 +1738,7 @@ mod tests {
                 cmd: vec!["true".to_string()],
             }),
             validators: vec!["false".to_string()], // Always fails
+            policy: crate::policy::PolicyConfig::permissive(),
         };
 
         let mut engine = RunEngine::new(dir.path(), config, tasks).unwrap();
@@ -1615,5 +1751,146 @@ mod tests {
         assert!(!result.validators_passed);
         // No checkpoint should be created
         assert!(result.checkpoint_sha.is_none());
+    }
+
+    #[test]
+    fn test_policy_violation_blocks_checkpoint() {
+        let (dir, _, tasks) = setup_test_repo();
+
+        // Create config with strict policy (deny deletes/renames)
+        let config = Config {
+            git_mode: GitMode::Branch,
+            agent: Some(AgentConfig {
+                runner_type: "command".to_string(),
+                cmd: vec!["true".to_string()],
+            }),
+            validators: vec![],
+            policy: crate::policy::PolicyConfig::new(), // Default denies deletes/renames
+        };
+
+        let mut engine = RunEngine::new(dir.path(), config, tasks).unwrap();
+        engine.start().unwrap();
+
+        // Delete a file to trigger policy violation
+        fs::remove_file(dir.path().join("README.md")).unwrap();
+
+        let result = engine.next_iteration().unwrap();
+
+        // Should fail because of policy violation (and abort)
+        assert!(!result.success);
+        assert!(!result.policy_passed);
+        assert!(result.checkpoint_sha.is_none());
+        // Run should be aborted
+        assert_eq!(engine.run().state, RunState::Aborted);
+    }
+
+    #[test]
+    fn test_policy_reset_action_discards_changes() {
+        let (dir, _, tasks) = setup_test_repo();
+
+        // Create config with policy that resets on violation
+        let mut policy = crate::policy::PolicyConfig::new();
+        policy.on_violation = crate::policy::ViolationAction::Reset;
+
+        let config = Config {
+            git_mode: GitMode::Branch,
+            agent: Some(AgentConfig {
+                runner_type: "command".to_string(),
+                cmd: vec!["true".to_string()],
+            }),
+            validators: vec![],
+            policy,
+        };
+
+        let mut engine = RunEngine::new(dir.path(), config, tasks).unwrap();
+        engine.start().unwrap();
+
+        // Delete a file to trigger policy violation
+        fs::remove_file(dir.path().join("README.md")).unwrap();
+        assert!(!dir.path().join("README.md").exists());
+
+        engine.next_iteration().unwrap();
+
+        // File should be restored after reset
+        assert!(dir.path().join("README.md").exists());
+    }
+
+    #[test]
+    fn test_policy_keep_action_allows_violation() {
+        let (dir, _, tasks) = setup_test_repo();
+
+        // Create config with policy that keeps changes on violation
+        let mut policy = crate::policy::PolicyConfig::new();
+        policy.on_violation = crate::policy::ViolationAction::Keep;
+
+        let config = Config {
+            git_mode: GitMode::Branch,
+            agent: Some(AgentConfig {
+                runner_type: "command".to_string(),
+                cmd: vec!["true".to_string()],
+            }),
+            validators: vec![],
+            policy,
+        };
+
+        let mut engine = RunEngine::new(dir.path(), config, tasks).unwrap();
+        engine.start().unwrap();
+
+        // Delete a file to trigger policy violation
+        fs::remove_file(dir.path().join("README.md")).unwrap();
+
+        let result = engine.next_iteration().unwrap();
+
+        // Policy failed but iteration continues with action=keep
+        assert!(!result.policy_passed);
+        // Success should still be true with keep action
+        assert!(result.success);
+        // Run should not be aborted
+        assert_eq!(engine.run().state, RunState::Running);
+    }
+
+    #[test]
+    fn test_policy_allow_paths() {
+        let (dir, _, tasks) = setup_test_repo();
+
+        // Create config that allows deletions in test/ directory
+        let mut policy = crate::policy::PolicyConfig::new();
+        policy.allow_paths = vec!["test/**".to_string()];
+
+        let config = Config {
+            git_mode: GitMode::Branch,
+            agent: Some(AgentConfig {
+                runner_type: "command".to_string(),
+                cmd: vec!["true".to_string()],
+            }),
+            validators: vec![],
+            policy,
+        };
+
+        // Create and commit a test file
+        fs::create_dir_all(dir.path().join("test")).unwrap();
+        fs::write(dir.path().join("test/fixture.txt"), "test data").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Add test fixture"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let mut engine = RunEngine::new(dir.path(), config, tasks).unwrap();
+        engine.start().unwrap();
+
+        // Delete the test file (should be allowed by policy)
+        fs::remove_file(dir.path().join("test/fixture.txt")).unwrap();
+
+        let result = engine.next_iteration().unwrap();
+
+        // Should pass because deletion is in allowed path
+        assert!(result.policy_passed);
+        assert!(result.success);
     }
 }
