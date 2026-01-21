@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{debug, info, trace, warn};
 
 use crate::config::{Config, GitMode};
 use crate::event::{EventKind, EventLog, RunId, generate_run_id};
@@ -254,6 +255,8 @@ impl RunEngine {
     /// Initialize and start the run.
     /// Sets up the workspace (creates branch in branch mode) and emits RunStarted.
     pub fn start(&mut self) -> Result<()> {
+        debug!(run_id = %self.run.run_id, state = ?self.run.state, "starting run");
+
         if self.run.state != RunState::Idle {
             anyhow::bail!(
                 "Cannot start run: current state is {:?}, expected Idle",
@@ -263,6 +266,7 @@ impl RunEngine {
 
         // Check for dirty working tree
         if self.workspace.is_dirty()? {
+            warn!("working tree has uncommitted changes");
             anyhow::bail!(
                 "Working tree has uncommitted changes. Commit or stash them before starting a run."
             );
@@ -271,12 +275,14 @@ impl RunEngine {
         // In branch mode, create the run branch
         if self.config.git_mode == GitMode::Branch {
             let original_branch = self.workspace.current_branch()?;
+            debug!(original_branch = %original_branch, "saving original branch");
             self.run.original_branch = Some(original_branch);
 
             // Create the run branch (workspace manager is not &mut, so we need to recreate)
             let mut workspace = WorkspaceManager::new(&self.repo_path, self.config.git_mode);
             workspace.create_branch(&self.run.run_id)?;
             self.run.run_branch = workspace.run_branch().map(|s| s.to_string());
+            info!(run_branch = ?self.run.run_branch, "created run branch");
             self.workspace = workspace;
         }
 
@@ -299,6 +305,8 @@ impl RunEngine {
     /// Execute a single iteration of the run loop.
     /// Returns the iteration result or an error.
     pub fn next_iteration(&mut self) -> Result<IterationResult> {
+        trace!(state = ?self.run.state, "next_iteration called");
+
         if self.run.state != RunState::Running {
             anyhow::bail!(
                 "Cannot run iteration: current state is {:?}, expected Running",
@@ -312,6 +320,7 @@ impl RunEngine {
             Some(t) => t,
             None => {
                 // No more tasks - run is complete
+                info!("no more tasks, completing run");
                 self.complete()?;
                 return Ok(IterationResult {
                     success: true,
@@ -325,6 +334,12 @@ impl RunEngine {
         // Increment iteration
         self.run.iteration += 1;
         self.run.current_task_id = Some(task.id.clone());
+        info!(
+            iteration = self.run.iteration,
+            task_id = %task.id,
+            task_title = %task.title,
+            "starting iteration"
+        );
 
         // Emit IterationStarted
         self.event_log.emit_now(EventKind::IterationStarted {
@@ -349,11 +364,15 @@ impl RunEngine {
         }
 
         // Execute agent command
+        debug!(task_id = %task.id, "executing agent");
         let agent_exit_code = match self.execute_agent(&task) {
-            Ok(code) => Some(code),
+            Ok(code) => {
+                debug!(exit_code = code, "agent completed");
+                Some(code)
+            }
             Err(e) => {
                 // Log the error but don't fail the run - treat as agent failure
-                eprintln!("Agent execution error: {}", e);
+                warn!(error = %e, "agent execution error");
                 Some(-1)
             }
         };
@@ -370,6 +389,12 @@ impl RunEngine {
         {
             let old_status = t.status;
             t.status = update.new_status;
+            info!(
+                task_id = %update.task_id,
+                old_status = ?old_status,
+                new_status = ?update.new_status,
+                "task status changed"
+            );
             if let Some(notes) = update.notes {
                 t.notes = Some(notes);
             }
@@ -381,6 +406,8 @@ impl RunEngine {
                 old_status,
                 new_status: update.new_status,
             })?;
+        } else {
+            trace!("no task update from agent");
         }
 
         // TODO: Run validators (for now, simulate pass)
@@ -394,6 +421,7 @@ impl RunEngine {
         if success {
             // Check if there are any staged or unstaged changes to commit
             let has_changes = self.workspace.is_dirty().unwrap_or(false);
+            trace!(has_changes, "checking for uncommitted changes");
             if has_changes {
                 // Stage all changes
                 Command::new("git")
@@ -405,10 +433,11 @@ impl RunEngine {
                 // Create checkpoint commit
                 match self.checkpoint(&task.id, &task.title) {
                     Ok(sha) => {
+                        info!(sha = %sha, "created checkpoint");
                         checkpoint_sha = Some(sha);
                     }
                     Err(e) => {
-                        eprintln!("Failed to create checkpoint: {}", e);
+                        warn!(error = %e, "failed to create checkpoint");
                     }
                 }
             }
@@ -504,6 +533,8 @@ impl RunEngine {
             anyhow::bail!("Agent command is empty");
         }
 
+        trace!(cmd = ?agent_config.cmd, "agent config loaded");
+
         // Create iteration directory
         let iter_dir = self.iteration_dir(self.run.iteration);
         fs::create_dir_all(&iter_dir).with_context(|| {
@@ -512,6 +543,7 @@ impl RunEngine {
                 iter_dir.display()
             )
         })?;
+        debug!(iter_dir = %iter_dir.display(), "created iteration directory");
 
         // Remove any existing task_update.json from previous iteration
         let task_update_path = self.task_update_path();
@@ -631,6 +663,7 @@ impl RunEngine {
 
     /// Pause the run.
     pub fn pause(&mut self) -> Result<()> {
+        debug!(run_id = %self.run.run_id, "pausing run");
         if self.run.state != RunState::Running {
             anyhow::bail!(
                 "Cannot pause: current state is {:?}, expected Running",
@@ -645,12 +678,14 @@ impl RunEngine {
         })?;
 
         self.run.save(&self.repo_path)?;
+        info!(run_id = %self.run.run_id, "run paused");
 
         Ok(())
     }
 
     /// Resume a paused run.
     pub fn resume(&mut self) -> Result<()> {
+        debug!(run_id = %self.run.run_id, "resuming run");
         if self.run.state != RunState::Paused {
             anyhow::bail!(
                 "Cannot resume: current state is {:?}, expected Paused",
@@ -665,12 +700,14 @@ impl RunEngine {
         })?;
 
         self.run.save(&self.repo_path)?;
+        info!(run_id = %self.run.run_id, "run resumed");
 
         Ok(())
     }
 
     /// Abort the run.
     pub fn abort(&mut self, reason: &str) -> Result<()> {
+        debug!(run_id = %self.run.run_id, reason, "aborting run");
         if self.run.state.is_terminal() {
             anyhow::bail!(
                 "Cannot abort: run is already in terminal state {:?}",
@@ -692,12 +729,14 @@ impl RunEngine {
         })?;
 
         self.run.save(&self.repo_path)?;
+        info!(run_id = %self.run.run_id, reason, "run aborted");
 
         Ok(())
     }
 
     /// Mark the run as completed.
     fn complete(&mut self) -> Result<()> {
+        debug!(run_id = %self.run.run_id, "completing run");
         self.run.state = RunState::Completed;
         self.run.ended_at = Some(
             SystemTime::now()
@@ -715,6 +754,12 @@ impl RunEngine {
         })?;
 
         self.run.save(&self.repo_path)?;
+        info!(
+            run_id = %self.run.run_id,
+            total_iterations = self.run.iteration,
+            tasks_completed,
+            "run completed"
+        );
 
         Ok(())
     }

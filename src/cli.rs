@@ -16,6 +16,10 @@ pub enum Command {
         /// Run only one iteration then stop (useful for testing)
         #[arg(long)]
         once: bool,
+
+        /// Stop after the current task completes (for reviewing changes)
+        #[arg(long)]
+        task: bool,
     },
 
     /// Start a new run explicitly (fails if a run is already in progress)
@@ -23,6 +27,10 @@ pub enum Command {
         /// Run only one iteration then stop (useful for testing)
         #[arg(long)]
         once: bool,
+
+        /// Stop after the current task completes (for reviewing changes)
+        #[arg(long)]
+        task: bool,
     },
 
     /// Show current run status without launching TUI

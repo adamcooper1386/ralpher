@@ -6,16 +6,27 @@ use ralpher::run::{Run, RunEngine, RunState};
 use ralpher::task::{TaskList, TaskStatus};
 use std::env;
 use std::path::Path;
+use tracing::debug;
+use tracing_subscriber::EnvFilter;
 
 const RALPHER_DIR: &str = ".ralpher";
 
 fn main() -> Result<()> {
+    // Initialize tracing with WARN as default, respecting RUST_LOG
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+        )
+        .init();
+
     let cli = Cli::parse();
     let cwd = env::current_dir()?;
 
+    debug!(?cli.command, "parsed CLI arguments");
+
     match cli.command {
-        Command::Continue { once } => cmd_continue(&cwd, once)?,
-        Command::Start { once } => cmd_start(&cwd, once)?,
+        Command::Continue { once, task } => cmd_continue(&cwd, once, task)?,
+        Command::Start { once, task } => cmd_start(&cwd, once, task)?,
         Command::Status => cmd_status(&cwd)?,
         Command::Validate => cmd_validate(&cwd)?,
         Command::Abort => cmd_abort(&cwd)?,
@@ -26,7 +37,7 @@ fn main() -> Result<()> {
 }
 
 /// Continue an existing run or start a new one.
-fn cmd_continue(cwd: &Path, once: bool) -> Result<()> {
+fn cmd_continue(cwd: &Path, once: bool, task: bool) -> Result<()> {
     let (config, _) = Config::load(cwd)?;
     let tasks = TaskList::load(cwd)?;
 
@@ -62,7 +73,7 @@ fn cmd_continue(cwd: &Path, once: bool) -> Result<()> {
         if once {
             run_single_iteration(&mut engine)?;
         } else {
-            run_iterations(&mut engine)?;
+            run_iterations(&mut engine, task)?;
         }
     } else {
         // No existing run, start a new one
@@ -79,7 +90,7 @@ fn cmd_continue(cwd: &Path, once: bool) -> Result<()> {
         if once {
             run_single_iteration(&mut engine)?;
         } else {
-            run_iterations(&mut engine)?;
+            run_iterations(&mut engine, task)?;
         }
     }
 
@@ -87,7 +98,7 @@ fn cmd_continue(cwd: &Path, once: bool) -> Result<()> {
 }
 
 /// Start a new run explicitly.
-fn cmd_start(cwd: &Path, once: bool) -> Result<()> {
+fn cmd_start(cwd: &Path, once: bool, task: bool) -> Result<()> {
     let (config, _) = Config::load(cwd)?;
     let tasks = TaskList::load(cwd)?;
 
@@ -124,7 +135,7 @@ fn cmd_start(cwd: &Path, once: bool) -> Result<()> {
     if once {
         run_single_iteration(&mut engine)?;
     } else {
-        run_iterations(&mut engine)?;
+        run_iterations(&mut engine, task)?;
     }
 
     Ok(())
@@ -301,7 +312,7 @@ fn run_single_iteration(engine: &mut RunEngine) -> Result<()> {
 }
 
 /// Run iterations until completion, max iterations, or failure.
-fn run_iterations(engine: &mut RunEngine) -> Result<()> {
+fn run_iterations(engine: &mut RunEngine, stop_on_task_complete: bool) -> Result<()> {
     let max_iterations = DEFAULT_MAX_ITERATIONS;
     let start_iteration = engine.run().iteration;
 
@@ -316,6 +327,9 @@ fn run_iterations(engine: &mut RunEngine) -> Result<()> {
             engine.pause()?;
             break;
         }
+
+        // Track current task before iteration (for --task flag)
+        let task_before = engine.run().current_task_id.clone();
 
         // Run one iteration
         let result = engine.next_iteration()?;
@@ -351,6 +365,18 @@ fn run_iterations(engine: &mut RunEngine) -> Result<()> {
             println!("Use `ralpher continue` to retry or `ralpher abort` to stop.");
             engine.pause()?;
             break;
+        }
+
+        // Check if task changed and we should stop (--task flag)
+        if stop_on_task_complete {
+            let task_after = engine.tasks().current_task().map(|t| t.id.clone());
+            if task_before.is_some() && task_after != task_before {
+                println!();
+                println!("Task completed. Pausing for review.");
+                println!("Use `ralpher continue` to proceed to the next task.");
+                engine.pause()?;
+                break;
+            }
         }
     }
 
