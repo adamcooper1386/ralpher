@@ -108,7 +108,30 @@ Artifacts in `.ralpher/`:
 
 TUI must be able to reconstruct current state from artifacts.
 
-## 8. MVP scope
+## 8. Agent requirements
+
+The configured agent command must have sufficient permissions to:
+
+**Required:**
+- Write files in the repository (to make code changes)
+- Write `.ralpher/task_update.json` (to signal task completion)
+
+**Recommended:**
+- Read files in the repository
+- Execute shell commands (for running tests/validators)
+
+For Claude Code, this means using `--dangerously-skip-permissions` or equivalent flags that enable tool use in non-interactive mode.
+
+Example config:
+```toml
+[agent]
+type = "command"
+cmd = ["claude", "--dangerously-skip-permissions"]
+```
+
+**Future:** A permissions layer may allow fine-grained control over what the agent can do (e.g., allow writes but deny network access).
+
+## 9. MVP scope
 
 Must-have:
 - `ralpher continue` + TUI
@@ -127,4 +150,5 @@ Should-have:
 Nice-to-have:
 - parallel worktrees
 - provider-specific adapters for Claude Code/Codex/Gemini telemetry
+- configurable permissions layer for agent sandboxing
 

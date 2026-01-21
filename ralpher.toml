@@ -6,4 +6,5 @@ git_mode = "branch"
 [agent]
 type = "command"
 # Base command - ralpher will add -p with composed prompt including task context
-cmd = ["claude"]
+# --dangerously-skip-permissions allows Claude to write files without prompting
+cmd = ["claude", "--dangerously-skip-permissions"]
