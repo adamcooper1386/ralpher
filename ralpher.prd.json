@@ -75,7 +75,7 @@
     {
       "id": "tui-basic",
       "title": "Basic TUI with progress display",
-      "status": "todo",
+      "status": "done",
       "acceptance": [
         "Show current run state, iteration count, elapsed time",
         "Show task list with status indicators",
@@ -83,7 +83,7 @@
         "Show progress percentage",
         "Live update from events.ndjson"
       ],
-      "notes": "Use ratatui + crossterm. Read events for live updates."
+      "notes": "Implemented basic TUI with ratatui + crossterm. Features: header showing run state/iteration/elapsed time, progress gauge, task list with status indicators, current task details panel, live event log that reads incrementally from events.ndjson. Supports 'q' to quit and 'r' to refresh. Auto-refreshes every 250ms."
     },
     {
       "id": "tui-log-panel",

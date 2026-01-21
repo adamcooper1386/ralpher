@@ -4,4 +4,5 @@ pub mod event;
 pub mod policy;
 pub mod run;
 pub mod task;
+pub mod tui;
 pub mod workspace;
