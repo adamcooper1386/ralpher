@@ -88,13 +88,13 @@
     {
       "id": "tui-log-panel",
       "title": "TUI log panel for agent/validator output",
-      "status": "todo",
+      "status": "done",
       "acceptance": [
         "Bottom panel shows live log tail",
         "Toggle between agent and validator logs",
         "Scroll through log history"
       ],
-      "notes": "Key 'l' to toggle log source per tech.md."
+      "notes": "Implemented TUI log panel with: LogSource enum for agent/validator toggle, live log tail display in bottom panel, 'l' key to toggle log source, j/k/PageUp/PageDown/Home/End for scrolling, incremental agent log reading, validator JSON parsing and formatting, syntax highlighting for errors/warnings/pass/fail"
     },
     {
       "id": "tui-controls",
