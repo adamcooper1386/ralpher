@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, trace, warn};
 
 use crate::config::{Config, GitMode};
-use crate::event::{EventKind, EventLog, RunId, generate_run_id};
+use crate::event::{EventKind, EventLog, RunId, ValidatorStatus, generate_run_id};
 use crate::task::{Task, TaskList, TaskStatus};
 use crate::workspace::WorkspaceManager;
 
@@ -18,6 +18,7 @@ const EVENTS_FILE: &str = "events.ndjson";
 const ITERATIONS_DIR: &str = "iterations";
 const AGENT_LOG_FILE: &str = "agent.log";
 const TASK_UPDATE_FILE: &str = "task_update.json";
+const VALIDATE_FILE: &str = "validate.json";
 
 /// Task update written by the agent to report progress.
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -32,6 +33,28 @@ pub struct TaskUpdate {
     /// Optional evidence (paths changed, commands run).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Vec<String>>,
+}
+
+/// Result of running a single validator command.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SingleValidatorResult {
+    /// The validator command that was run.
+    pub command: String,
+    /// Status of the validator (pass/fail/skipped).
+    pub status: ValidatorStatus,
+    /// Exit code from the command.
+    pub exit_code: Option<i32>,
+    /// Captured stdout + stderr output (truncated if large).
+    pub output: Option<String>,
+}
+
+/// Results of running all validators for an iteration.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ValidationResults {
+    /// Results for each validator.
+    pub validators: Vec<SingleValidatorResult>,
+    /// Whether all validators passed.
+    pub all_passed: bool,
 }
 
 /// State of a ralpher run.
@@ -410,8 +433,9 @@ impl RunEngine {
             trace!("no task update from agent");
         }
 
-        // TODO: Run validators (for now, simulate pass)
-        let validators_passed = true;
+        // Run validators
+        let validation_results = self.execute_validators(&task)?;
+        let validators_passed = validation_results.all_passed;
 
         // Determine success and create checkpoint if appropriate
         let success = agent_exit_code == Some(0) && validators_passed;
@@ -636,6 +660,126 @@ impl RunEngine {
         serde_json::from_str(&content).ok()
     }
 
+    /// Execute all configured validators and return the results.
+    /// Emits ValidatorResult events for each validator.
+    fn execute_validators(&mut self, task: &Task) -> Result<ValidationResults> {
+        // Collect validators: task-specific override or global config
+        let validators = if !task.validators.is_empty() {
+            task.validators.clone()
+        } else {
+            self.config.validators.clone()
+        };
+
+        if validators.is_empty() {
+            debug!("no validators configured, skipping validation");
+            return Ok(ValidationResults {
+                validators: vec![],
+                all_passed: true,
+            });
+        }
+
+        debug!(count = validators.len(), "executing validators");
+
+        let iter_dir = self.iteration_dir(self.run.iteration);
+        let mut results = Vec::new();
+        let mut all_passed = true;
+
+        for validator_cmd in &validators {
+            debug!(validator = %validator_cmd, "running validator");
+
+            // Execute validator via shell
+            let output = Command::new("sh")
+                .args(["-c", validator_cmd])
+                .current_dir(&self.repo_path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output();
+
+            let (status, exit_code, output_text) = match output {
+                Ok(out) => {
+                    let code = out.status.code();
+                    let passed = code == Some(0);
+
+                    // Combine stdout and stderr, truncate if too large
+                    let mut combined = String::new();
+                    if !out.stdout.is_empty() {
+                        combined.push_str(&String::from_utf8_lossy(&out.stdout));
+                    }
+                    if !out.stderr.is_empty() {
+                        if !combined.is_empty() {
+                            combined.push('\n');
+                        }
+                        combined.push_str(&String::from_utf8_lossy(&out.stderr));
+                    }
+
+                    // Truncate to last 10KB if too large
+                    let truncated = if combined.len() > 10240 {
+                        let start = combined.len() - 10240;
+                        format!("...[truncated]...\n{}", &combined[start..])
+                    } else {
+                        combined
+                    };
+
+                    let status = if passed {
+                        ValidatorStatus::Pass
+                    } else {
+                        ValidatorStatus::Fail
+                    };
+
+                    if !passed {
+                        all_passed = false;
+                    }
+
+                    (status, code, Some(truncated))
+                }
+                Err(e) => {
+                    warn!(validator = %validator_cmd, error = %e, "validator execution failed");
+                    all_passed = false;
+                    (ValidatorStatus::Fail, None, Some(e.to_string()))
+                }
+            };
+
+            info!(
+                validator = %validator_cmd,
+                status = ?status,
+                exit_code = ?exit_code,
+                "validator completed"
+            );
+
+            // Emit ValidatorResult event
+            self.event_log.emit_now(EventKind::ValidatorResult {
+                run_id: self.run.run_id.clone(),
+                iteration: self.run.iteration,
+                validator: validator_cmd.clone(),
+                status,
+                message: output_text.clone(),
+            })?;
+
+            results.push(SingleValidatorResult {
+                command: validator_cmd.clone(),
+                status,
+                exit_code,
+                output: output_text,
+            });
+        }
+
+        // Save validation results to file
+        let validation_results = ValidationResults {
+            validators: results,
+            all_passed,
+        };
+
+        let validate_path = iter_dir.join(VALIDATE_FILE);
+        let content = serde_json::to_string_pretty(&validation_results)
+            .context("Failed to serialize validation results")?;
+        fs::write(&validate_path, content)
+            .with_context(|| format!("Failed to write {}", validate_path.display()))?;
+
+        debug!(all_passed, "validation complete");
+
+        Ok(validation_results)
+    }
+
     /// Update a task's status and emit an event.
     pub fn update_task_status(&mut self, task_id: &str, new_status: TaskStatus) -> Result<()> {
         let task = self.tasks.get_mut(task_id).context("Task not found")?;
@@ -792,6 +936,108 @@ impl RunEngine {
     pub fn events_path(&self) -> PathBuf {
         self.repo_path.join(RALPHER_DIR).join(EVENTS_FILE)
     }
+
+    /// Get the config.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+}
+
+/// Run validators standalone (for `ralpher validate` command).
+/// Returns the validation results without needing a full run context.
+pub fn run_validators_standalone(
+    repo_path: impl AsRef<Path>,
+    validators: &[String],
+) -> Result<ValidationResults> {
+    let repo_path = repo_path.as_ref();
+
+    if validators.is_empty() {
+        info!("no validators configured");
+        return Ok(ValidationResults {
+            validators: vec![],
+            all_passed: true,
+        });
+    }
+
+    info!(count = validators.len(), "running validators");
+
+    let mut results = Vec::new();
+    let mut all_passed = true;
+
+    for validator_cmd in validators {
+        debug!(validator = %validator_cmd, "running validator");
+
+        // Execute validator via shell
+        let output = Command::new("sh")
+            .args(["-c", validator_cmd])
+            .current_dir(repo_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+
+        let (status, exit_code, output_text) = match output {
+            Ok(out) => {
+                let code = out.status.code();
+                let passed = code == Some(0);
+
+                // Combine stdout and stderr
+                let mut combined = String::new();
+                if !out.stdout.is_empty() {
+                    combined.push_str(&String::from_utf8_lossy(&out.stdout));
+                }
+                if !out.stderr.is_empty() {
+                    if !combined.is_empty() {
+                        combined.push('\n');
+                    }
+                    combined.push_str(&String::from_utf8_lossy(&out.stderr));
+                }
+
+                // Truncate to last 10KB if too large
+                let truncated = if combined.len() > 10240 {
+                    let start = combined.len() - 10240;
+                    format!("...[truncated]...\n{}", &combined[start..])
+                } else {
+                    combined
+                };
+
+                let status = if passed {
+                    ValidatorStatus::Pass
+                } else {
+                    ValidatorStatus::Fail
+                };
+
+                if !passed {
+                    all_passed = false;
+                }
+
+                (status, code, Some(truncated))
+            }
+            Err(e) => {
+                warn!(validator = %validator_cmd, error = %e, "validator execution failed");
+                all_passed = false;
+                (ValidatorStatus::Fail, None, Some(e.to_string()))
+            }
+        };
+
+        info!(
+            validator = %validator_cmd,
+            status = ?status,
+            exit_code = ?exit_code,
+            "validator completed"
+        );
+
+        results.push(SingleValidatorResult {
+            command: validator_cmd.clone(),
+            status,
+            exit_code,
+            output: output_text,
+        });
+    }
+
+    Ok(ValidationResults {
+        validators: results,
+        all_passed,
+    })
 }
 
 #[cfg(test)]
@@ -846,6 +1092,7 @@ mod tests {
                 runner_type: "command".to_string(),
                 cmd: vec!["true".to_string()],
             }),
+            validators: vec![],
         };
 
         // Create task list with sample tasks and save to disk
@@ -984,6 +1231,7 @@ mod tests {
         let config = Config {
             git_mode: GitMode::Trunk,
             agent: None,
+            validators: vec![],
         };
         let mut engine = RunEngine::new(dir.path(), config, tasks).unwrap();
 
@@ -1169,6 +1417,7 @@ mod tests {
                 runner_type: "command".to_string(),
                 cmd: vec![agent_script.to_str().unwrap().to_string()],
             }),
+            validators: vec![],
         };
 
         let mut engine = RunEngine::new(dir.path(), config, tasks).unwrap();
@@ -1236,5 +1485,135 @@ mod tests {
         // Since task status changed (from todo to in_progress), there should be a checkpoint
         assert!(result.checkpoint_sha.is_some());
         assert!(engine.run().last_checkpoint.is_some());
+    }
+
+    #[test]
+    fn test_run_validators_standalone_pass() {
+        let dir = TempDir::new().unwrap();
+        let validators = vec!["true".to_string(), "echo hello".to_string()];
+
+        let results = run_validators_standalone(dir.path(), &validators).unwrap();
+
+        assert!(results.all_passed);
+        assert_eq!(results.validators.len(), 2);
+        assert_eq!(results.validators[0].status, ValidatorStatus::Pass);
+        assert_eq!(results.validators[1].status, ValidatorStatus::Pass);
+    }
+
+    #[test]
+    fn test_run_validators_standalone_fail() {
+        let dir = TempDir::new().unwrap();
+        let validators = vec!["false".to_string()];
+
+        let results = run_validators_standalone(dir.path(), &validators).unwrap();
+
+        assert!(!results.all_passed);
+        assert_eq!(results.validators.len(), 1);
+        assert_eq!(results.validators[0].status, ValidatorStatus::Fail);
+        assert_eq!(results.validators[0].exit_code, Some(1));
+    }
+
+    #[test]
+    fn test_run_validators_standalone_empty() {
+        let dir = TempDir::new().unwrap();
+        let validators: Vec<String> = vec![];
+
+        let results = run_validators_standalone(dir.path(), &validators).unwrap();
+
+        assert!(results.all_passed);
+        assert!(results.validators.is_empty());
+    }
+
+    #[test]
+    fn test_run_validators_standalone_captures_output() {
+        let dir = TempDir::new().unwrap();
+        let validators = vec!["echo test_output".to_string()];
+
+        let results = run_validators_standalone(dir.path(), &validators).unwrap();
+
+        assert!(results.all_passed);
+        assert_eq!(results.validators.len(), 1);
+        assert!(
+            results.validators[0]
+                .output
+                .as_ref()
+                .unwrap()
+                .contains("test_output")
+        );
+    }
+
+    #[test]
+    fn test_validators_block_checkpoint_on_fail() {
+        let dir = TempDir::new().unwrap();
+
+        // Initialize git repo
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        // Create initial commit
+        fs::write(dir.path().join("README.md"), "# Test\n").unwrap();
+        fs::write(dir.path().join(".gitignore"), ".ralpher/\n").unwrap();
+
+        // Create task list
+        let tasks = TaskList::new(vec![Task {
+            id: "task-1".to_string(),
+            title: "First task".to_string(),
+            status: TaskStatus::Todo,
+            acceptance: vec![],
+            validators: vec![],
+            notes: None,
+        }]);
+        let task_path = dir.path().join("ralpher.prd.json");
+        tasks.save_to(&task_path).unwrap();
+
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Initial commit"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        // Load tasks back so they have the path set
+        let tasks = TaskList::load(dir.path()).unwrap();
+
+        // Config with a failing validator
+        let config = Config {
+            git_mode: GitMode::Branch,
+            agent: Some(AgentConfig {
+                runner_type: "command".to_string(),
+                cmd: vec!["true".to_string()],
+            }),
+            validators: vec!["false".to_string()], // Always fails
+        };
+
+        let mut engine = RunEngine::new(dir.path(), config, tasks).unwrap();
+        engine.start().unwrap();
+
+        let result = engine.next_iteration().unwrap();
+
+        // Iteration should fail because validator failed
+        assert!(!result.success);
+        assert!(!result.validators_passed);
+        // No checkpoint should be created
+        assert!(result.checkpoint_sha.is_none());
     }
 }

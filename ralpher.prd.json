@@ -38,14 +38,14 @@
     {
       "id": "validator-execution",
       "title": "Execute validator commands",
-      "status": "todo",
+      "status": "done",
       "acceptance": [
         "Run configured validators after agent completes",
         "Capture exit codes and output",
         "Emit ValidatorResult events",
         "Validators passing required for checkpoint"
       ],
-      "notes": "Validators are commands like 'cargo test'. Config schema may need validators field."
+      "notes": "Implemented validator execution: added validators config field, execute_validators method in RunEngine that runs shell commands and captures exit codes/output, emits ValidatorResult events for each validator, gates checkpoint creation on all validators passing. Added run_validators_standalone function for `ralpher validate` command. Includes 5 new unit tests and 3 new integration tests. All 60 unit tests and 29 integration tests pass."
     },
     {
       "id": "policy-engine",

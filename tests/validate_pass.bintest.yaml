@@ -6,12 +6,12 @@ sandbox:
   inherit_env: true
 
 tests:
-  - name: "validate with no validators configured"
+  - name: "validate with passing validator"
     setup:
       - write_file:
           path: "ralpher.toml"
           contents: |
-            # minimal
+            validators = ["true"]
     steps:
       - name: run
         run:
@@ -20,4 +20,4 @@ tests:
         expect:
           exit: 0
           stdout:
-            contains: "no validators configured"
+            contains: "validation complete"

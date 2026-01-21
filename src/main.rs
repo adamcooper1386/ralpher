@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use ralpher::cli::{Cli, Command};
 use ralpher::config::Config;
-use ralpher::run::{Run, RunEngine, RunState};
+use ralpher::run::{Run, RunEngine, RunState, run_validators_standalone};
 use ralpher::task::{TaskList, TaskStatus};
 use std::env;
 use std::path::Path;
@@ -210,10 +210,40 @@ fn cmd_status(cwd: &Path) -> Result<()> {
 
 /// Run validators only.
 fn cmd_validate(cwd: &Path) -> Result<()> {
-    let (_, path) = Config::load(cwd)?;
+    let (config, path) = Config::load(cwd)?;
     info!(config_path = %path.display(), "config loaded");
-    info!("validators not yet implemented");
-    // TODO: Implement validator execution
+
+    if config.validators.is_empty() {
+        info!("no validators configured in ralpher.toml");
+        return Ok(());
+    }
+
+    let results = run_validators_standalone(cwd, &config.validators)?;
+
+    // Print summary
+    let passed = results
+        .validators
+        .iter()
+        .filter(|v| v.status == ralpher::event::ValidatorStatus::Pass)
+        .count();
+    let failed = results
+        .validators
+        .iter()
+        .filter(|v| v.status == ralpher::event::ValidatorStatus::Fail)
+        .count();
+
+    info!(
+        passed = passed,
+        failed = failed,
+        total = results.validators.len(),
+        all_passed = results.all_passed,
+        "validation complete"
+    );
+
+    if !results.all_passed {
+        anyhow::bail!("Some validators failed");
+    }
+
     Ok(())
 }
 

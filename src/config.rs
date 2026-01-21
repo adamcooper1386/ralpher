@@ -33,6 +33,10 @@ pub struct Config {
     pub git_mode: GitMode,
     /// Agent runner configuration.
     pub agent: Option<AgentConfig>,
+    /// Global validators to run after each agent execution.
+    /// Each validator is a shell command string.
+    #[serde(default)]
+    pub validators: Vec<String>,
 }
 
 impl Config {

@@ -6,18 +6,18 @@ sandbox:
   inherit_env: true
 
 tests:
-  - name: "validate with no validators configured"
+  - name: "validate with failing validator"
     setup:
       - write_file:
           path: "ralpher.toml"
           contents: |
-            # minimal
+            validators = ["false"]
     steps:
       - name: run
         run:
           cmd: "sh"
           args: ["-c", "RUST_LOG=info ${BINARY} validate 2>&1"]
         expect:
-          exit: 0
+          exit: 1
           stdout:
-            contains: "no validators configured"
+            contains: "Some validators failed"
