@@ -63,14 +63,14 @@
     {
       "id": "iteration-loop",
       "title": "Run iterations until completion or budget",
-      "status": "todo",
+      "status": "done",
       "acceptance": [
         "ralpher continue runs multiple iterations, not just one",
         "Stop when all tasks done or max_iterations reached",
         "Stop on policy violation (configurable)",
         "Support pause via signal or future TUI control"
       ],
-      "notes": "Currently runs exactly one iteration per command invocation."
+      "notes": "Implemented iteration loop: (1) ralpher continue now runs multiple iterations until completion via run_iterations(); (2) Added configurable max_iterations in ralpher.toml (default 100) - stops and pauses when limit reached; (3) Policy violations already stop runs based on on_violation config (abort/reset/keep); (4) Added Ctrl+C signal handling for graceful pause - first Ctrl+C pauses after current iteration, second exits immediately. Added 3 new unit tests for max_iterations config. All 85 unit tests and 29 integration tests pass."
     },
     {
       "id": "tui-basic",

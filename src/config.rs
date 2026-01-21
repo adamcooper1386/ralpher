@@ -27,8 +27,11 @@ pub struct AgentConfig {
     pub cmd: Vec<String>,
 }
 
+/// Default maximum iterations before pausing.
+pub const DEFAULT_MAX_ITERATIONS: u32 = 100;
+
 /// Top-level ralpher configuration.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct Config {
     /// Git mode for checkpointing.
     #[serde(default)]
@@ -42,6 +45,26 @@ pub struct Config {
     /// Policy configuration for diff checking.
     #[serde(default)]
     pub policy: PolicyConfig,
+    /// Maximum iterations before pausing (default: 100).
+    #[serde(default = "default_max_iterations")]
+    pub max_iterations: u32,
+}
+
+impl Config {
+    /// Create a new config with all defaults.
+    pub fn new() -> Self {
+        Self {
+            git_mode: GitMode::default(),
+            agent: None,
+            validators: Vec::new(),
+            policy: PolicyConfig::default(),
+            max_iterations: DEFAULT_MAX_ITERATIONS,
+        }
+    }
+}
+
+fn default_max_iterations() -> u32 {
+    DEFAULT_MAX_ITERATIONS
 }
 
 impl Config {
@@ -149,5 +172,42 @@ on_violation = "reset"
         assert_eq!(config.policy.allow_paths, vec!["*.tmp", "test/**"]);
         assert_eq!(config.policy.deny_paths, vec!["secrets/*"]);
         assert_eq!(config.policy.on_violation, ViolationAction::Reset);
+    }
+
+    #[test]
+    fn test_load_config_with_max_iterations() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("ralpher.toml");
+        let mut file = std::fs::File::create(&config_path).unwrap();
+        writeln!(
+            file,
+            r#"
+max_iterations = 50
+"#
+        )
+        .unwrap();
+
+        let (config, _) = Config::load(dir.path()).unwrap();
+        assert_eq!(config.max_iterations, 50);
+    }
+
+    #[test]
+    fn test_load_config_default_max_iterations() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("ralpher.toml");
+        let mut file = std::fs::File::create(&config_path).unwrap();
+        writeln!(file, "# minimal config without max_iterations").unwrap();
+
+        let (config, _) = Config::load(dir.path()).unwrap();
+        assert_eq!(config.max_iterations, DEFAULT_MAX_ITERATIONS);
+    }
+
+    #[test]
+    fn test_config_new() {
+        let config = Config::new();
+        assert_eq!(config.git_mode, GitMode::Branch);
+        assert!(config.agent.is_none());
+        assert!(config.validators.is_empty());
+        assert_eq!(config.max_iterations, DEFAULT_MAX_ITERATIONS);
     }
 }

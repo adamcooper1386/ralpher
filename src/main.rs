@@ -6,10 +6,15 @@ use ralpher::run::{Run, RunEngine, RunState, run_validators_standalone};
 use ralpher::task::{TaskList, TaskStatus};
 use std::env;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 const RALPHER_DIR: &str = ".ralpher";
+
+/// Global flag for pause signal (Ctrl+C).
+static PAUSE_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -22,6 +27,22 @@ fn main() -> Result<()> {
     };
     tracing_subscriber::fmt().with_env_filter(filter).init();
     let cwd = env::current_dir()?;
+
+    // Set up Ctrl+C handler for pause signal
+    let pause_flag = Arc::new(AtomicBool::new(false));
+    let pause_flag_handler = Arc::clone(&pause_flag);
+    ctrlc::set_handler(move || {
+        if pause_flag_handler.load(Ordering::SeqCst) {
+            // Second Ctrl+C, exit immediately
+            info!("received second interrupt, exiting");
+            std::process::exit(130);
+        }
+        info!("received interrupt signal, will pause after current iteration");
+        info!("press Ctrl+C again to exit immediately");
+        pause_flag_handler.store(true, Ordering::SeqCst);
+        PAUSE_REQUESTED.store(true, Ordering::SeqCst);
+    })
+    .expect("Error setting Ctrl+C handler");
 
     debug!(?cli.command, "parsed CLI arguments");
 
@@ -310,9 +331,6 @@ fn cmd_clean(cwd: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Default maximum iterations before stopping.
-const DEFAULT_MAX_ITERATIONS: u32 = 100;
-
 /// Run a single iteration and print the result.
 fn run_single_iteration(engine: &mut RunEngine) -> Result<()> {
     let result = engine.next_iteration()?;
@@ -339,10 +357,20 @@ fn run_single_iteration(engine: &mut RunEngine) -> Result<()> {
 
 /// Run iterations until completion, max iterations, or failure.
 fn run_iterations(engine: &mut RunEngine, stop_on_task_complete: bool) -> Result<()> {
-    let max_iterations = DEFAULT_MAX_ITERATIONS;
+    let max_iterations = engine.config().max_iterations;
     let start_iteration = engine.run().iteration;
 
     loop {
+        // Check if pause was requested via signal (Ctrl+C)
+        if PAUSE_REQUESTED.load(Ordering::SeqCst) {
+            info!("pause requested via signal, pausing run");
+            info!("use `ralpher continue` to resume");
+            engine.pause()?;
+            // Reset the flag for next run
+            PAUSE_REQUESTED.store(false, Ordering::SeqCst);
+            break;
+        }
+
         // Check if we've hit the iteration limit
         if engine.run().iteration >= start_iteration + max_iterations {
             warn!(max_iterations, "reached maximum iterations, pausing run");
@@ -373,6 +401,12 @@ fn run_iterations(engine: &mut RunEngine, stop_on_task_complete: bool) -> Result
         // Check if run is finished
         if engine.run().state == RunState::Completed {
             info!("run completed, all tasks done");
+            break;
+        }
+
+        // Check if run was aborted (e.g., by policy violation)
+        if engine.run().state == RunState::Aborted {
+            info!("run aborted");
             break;
         }
 

@@ -1225,6 +1225,7 @@ mod tests {
             }),
             validators: vec![],
             policy: crate::policy::PolicyConfig::permissive(),
+            ..Config::default()
         };
 
         // Create task list with sample tasks and save to disk
@@ -1365,6 +1366,7 @@ mod tests {
             agent: None,
             validators: vec![],
             policy: crate::policy::PolicyConfig::permissive(),
+            ..Config::default()
         };
         let mut engine = RunEngine::new(dir.path(), config, tasks).unwrap();
 
@@ -1552,6 +1554,7 @@ mod tests {
             }),
             validators: vec![],
             policy: crate::policy::PolicyConfig::permissive(),
+            ..Config::default()
         };
 
         let mut engine = RunEngine::new(dir.path(), config, tasks).unwrap();
@@ -1739,6 +1742,7 @@ mod tests {
             }),
             validators: vec!["false".to_string()], // Always fails
             policy: crate::policy::PolicyConfig::permissive(),
+            ..Config::default()
         };
 
         let mut engine = RunEngine::new(dir.path(), config, tasks).unwrap();
@@ -1766,6 +1770,7 @@ mod tests {
             }),
             validators: vec![],
             policy: crate::policy::PolicyConfig::new(), // Default denies deletes/renames
+            ..Config::default()
         };
 
         let mut engine = RunEngine::new(dir.path(), config, tasks).unwrap();
@@ -1800,6 +1805,7 @@ mod tests {
             }),
             validators: vec![],
             policy,
+            ..Config::default()
         };
 
         let mut engine = RunEngine::new(dir.path(), config, tasks).unwrap();
@@ -1831,6 +1837,7 @@ mod tests {
             }),
             validators: vec![],
             policy,
+            ..Config::default()
         };
 
         let mut engine = RunEngine::new(dir.path(), config, tasks).unwrap();
@@ -1865,6 +1872,7 @@ mod tests {
             }),
             validators: vec![],
             policy,
+            ..Config::default()
         };
 
         // Create and commit a test file
