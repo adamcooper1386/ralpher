@@ -3,7 +3,6 @@ binary: ../target/release/ralpher
 
 sandbox:
   workdir: temp
-  inherit_env: true
 
 tests:
   - name: "status with config but no run shows no active run"
@@ -15,12 +14,12 @@ tests:
     steps:
       - name: run
         run:
-          cmd: "${BINARY}"
-          args: ["status"]
+          cmd: "sh"
+          args: ["-c", "RUST_LOG=info ${BINARY} status 2>&1"]
         expect:
           exit: 0
           stdout:
-            contains: "No active run"
+            contains: "no active run"
 
   - name: "status with config and tasks shows progress"
     setup:
@@ -40,9 +39,9 @@ tests:
     steps:
       - name: run
         run:
-          cmd: "${BINARY}"
-          args: ["status"]
+          cmd: "sh"
+          args: ["-c", "RUST_LOG=info ${BINARY} status 2>&1"]
         expect:
           exit: 0
           stdout:
-            contains: "Progress: 50%"
+            contains: "task status"

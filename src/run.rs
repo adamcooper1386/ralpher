@@ -574,6 +574,13 @@ impl RunEngine {
         args.push("-p");
         let prompt_ref = prompt.as_str();
 
+        debug!(
+            program = %program,
+            args = ?args,
+            prompt_len = prompt.len(),
+            "executing agent command"
+        );
+
         // Execute the command
         let output = Command::new(program)
             .args(&args)
@@ -583,6 +590,16 @@ impl RunEngine {
             .stderr(Stdio::piped())
             .output()
             .with_context(|| format!("Failed to execute agent command: {}", program))?;
+
+        trace!(
+            stdout_len = output.stdout.len(),
+            stderr_len = output.stderr.len(),
+            "agent output captured"
+        );
+
+        if !output.stderr.is_empty() {
+            trace!(stderr = %String::from_utf8_lossy(&output.stderr), "agent stderr");
+        }
 
         // Write stdout to log
         if !output.stdout.is_empty() {
@@ -601,6 +618,8 @@ impl RunEngine {
         // Write exit code
         let exit_code = output.status.code().unwrap_or(-1);
         writeln!(log_file, "=== exit code: {} ===", exit_code)?;
+
+        debug!(exit_code, "agent command completed");
 
         Ok(exit_code)
     }

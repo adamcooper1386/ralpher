@@ -15,9 +15,9 @@ tests:
     steps:
       - name: run
         run:
-          cmd: "${BINARY}"
-          args: ["clean"]
+          cmd: "sh"
+          args: ["-c", "RUST_LOG=info ${BINARY} clean 2>&1"]
         expect:
           exit: 0
           stdout:
-            contains: "No .ralpher/ directory found"
+            contains: "no .ralpher/ directory found"

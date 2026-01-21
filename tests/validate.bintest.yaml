@@ -15,9 +15,9 @@ tests:
     steps:
       - name: run
         run:
-          cmd: "${BINARY}"
-          args: ["validate"]
+          cmd: "sh"
+          args: ["-c", "RUST_LOG=info ${BINARY} validate 2>&1"]
         expect:
           exit: 0
           stdout:
-            contains: "Validators not yet implemented"
+            contains: "validators not yet implemented"

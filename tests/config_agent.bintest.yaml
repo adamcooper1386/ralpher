@@ -19,9 +19,9 @@ tests:
     steps:
       - name: run
         run:
-          cmd: "${BINARY}"
-          args: ["status"]
+          cmd: "sh"
+          args: ["-c", "RUST_LOG=info ${BINARY} status 2>&1"]
         expect:
           exit: 0
           stdout:
-            contains: "No active run"
+            contains: "no active run"

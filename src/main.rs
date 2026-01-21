@@ -6,7 +6,7 @@ use ralpher::run::{Run, RunEngine, RunState};
 use ralpher::task::{TaskList, TaskStatus};
 use std::env;
 use std::path::Path;
-use tracing::debug;
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 const RALPHER_DIR: &str = ".ralpher";
@@ -47,24 +47,24 @@ fn cmd_continue(cwd: &Path, once: bool, task: bool) -> Result<()> {
 
         match run.state {
             RunState::Completed => {
-                println!("Run {} is already completed.", run.run_id);
-                println!("Use `ralpher start` to begin a new run.");
+                info!(run_id = %run.run_id, "run is already completed");
+                info!("use `ralpher start` to begin a new run");
                 return Ok(());
             }
             RunState::Aborted => {
-                println!("Run {} was aborted.", run.run_id);
-                println!("Use `ralpher clean` then `ralpher start` to begin fresh.");
+                info!(run_id = %run.run_id, "run was aborted");
+                info!("use `ralpher clean` then `ralpher start` to begin fresh");
                 return Ok(());
             }
             RunState::Paused => {
-                println!("Resuming paused run {}...", run.run_id);
+                info!(run_id = %run.run_id, "resuming paused run");
                 engine.resume()?;
             }
             RunState::Running => {
-                println!("Run {} is already running.", run.run_id);
+                info!(run_id = %run.run_id, "run is already running");
             }
             RunState::Idle => {
-                println!("Starting idle run {}...", run.run_id);
+                info!(run_id = %run.run_id, "starting idle run");
                 engine.start()?;
             }
         }
@@ -77,13 +77,13 @@ fn cmd_continue(cwd: &Path, once: bool, task: bool) -> Result<()> {
         }
     } else {
         // No existing run, start a new one
-        println!("No existing run found. Starting new run...");
+        info!("no existing run found, starting new run");
         let mut engine = RunEngine::new(cwd, config, tasks)?;
         engine.start()?;
-        println!(
-            "Started run {} on branch {:?}",
-            engine.run().run_id,
-            engine.run().run_branch
+        info!(
+            run_id = %engine.run().run_id,
+            run_branch = ?engine.run().run_branch,
+            "started run"
         );
 
         // Run iterations
@@ -113,9 +113,10 @@ fn cmd_start(cwd: &Path, once: bool, task: bool) -> Result<()> {
             );
         }
         // Terminal run exists, warn but allow new run
-        println!(
-            "Previous run {} ended with state {:?}. Starting fresh...",
-            existing.run_id, existing.state
+        warn!(
+            run_id = %existing.run_id,
+            state = ?existing.state,
+            "previous run ended, starting fresh"
         );
     }
 
@@ -123,13 +124,13 @@ fn cmd_start(cwd: &Path, once: bool, task: bool) -> Result<()> {
     engine.start()?;
 
     let run = engine.run();
-    println!("Started new run: {}", run.run_id);
-    println!("  Git mode: {:?}", run.git_mode);
-    if let Some(branch) = &run.run_branch {
-        println!("  Branch: {}", branch);
-    }
-    println!("  Tasks: {}", engine.tasks().tasks.len());
-    println!();
+    info!(
+        run_id = %run.run_id,
+        git_mode = ?run.git_mode,
+        run_branch = ?run.run_branch,
+        task_count = engine.tasks().tasks.len(),
+        "started new run"
+    );
 
     // Run iterations
     if once {
@@ -144,7 +145,7 @@ fn cmd_start(cwd: &Path, once: bool, task: bool) -> Result<()> {
 /// Show current run status.
 fn cmd_status(cwd: &Path) -> Result<()> {
     if !Config::exists(cwd) {
-        println!("No ralpher.toml found in current directory.");
+        info!("no ralpher.toml found in current directory");
         return Ok(());
     }
 
@@ -153,60 +154,55 @@ fn cmd_status(cwd: &Path) -> Result<()> {
 
     // Check for existing run
     if let Some(run) = Run::load(cwd)? {
-        println!("Run: {}", run.run_id);
-        println!("  State: {:?}", run.state);
-        println!("  Git mode: {:?}", run.git_mode);
-        println!("  Iteration: {}", run.iteration);
-
-        if let Some(task_id) = &run.current_task_id {
-            println!("  Current task: {}", task_id);
-        }
-
-        if let Some(branch) = &run.run_branch {
-            println!("  Branch: {}", branch);
-        }
-
-        if let Some(sha) = &run.last_checkpoint {
-            println!("  Last checkpoint: {}", sha);
-        }
+        info!(
+            run_id = %run.run_id,
+            state = ?run.state,
+            git_mode = ?run.git_mode,
+            iteration = run.iteration,
+            current_task = ?run.current_task_id,
+            run_branch = ?run.run_branch,
+            last_checkpoint = ?run.last_checkpoint,
+            "run status"
+        );
 
         // Task progress
         if let Some(ref task_list) = tasks {
-            println!();
-            println!("Tasks:");
             let done = task_list.count_by_status(TaskStatus::Done);
             let in_progress = task_list.count_by_status(TaskStatus::InProgress);
             let todo = task_list.count_by_status(TaskStatus::Todo);
             let blocked = task_list.count_by_status(TaskStatus::Blocked);
             let total = task_list.tasks.len();
 
-            println!(
-                "  Progress: {:.0}% ({}/{} done)",
-                task_list.doneness(),
-                done,
-                total
-            );
-            println!(
-                "  Done: {}, In Progress: {}, Todo: {}, Blocked: {}",
-                done, in_progress, todo, blocked
+            info!(
+                progress_pct = format!("{:.0}", task_list.doneness()),
+                done = done,
+                in_progress = in_progress,
+                todo = todo,
+                blocked = blocked,
+                total = total,
+                "task progress"
             );
 
             if let Some(current) = task_list.current_task() {
-                println!();
-                println!("Current task: {} - {}", current.id, current.title);
+                info!(
+                    task_id = %current.id,
+                    task_title = %current.title,
+                    "current task"
+                );
             }
         }
     } else {
-        println!("No active run.");
+        info!("no active run");
 
         if let Some(ref task_list) = tasks {
-            println!();
-            println!("Tasks ({} total):", task_list.tasks.len());
-            println!("  Progress: {:.0}%", task_list.doneness());
+            info!(
+                total = task_list.tasks.len(),
+                progress_pct = format!("{:.0}", task_list.doneness()),
+                "task status"
+            );
         }
 
-        println!();
-        println!("Use `ralpher start` or `ralpher continue` to begin a run.");
+        info!("use `ralpher start` or `ralpher continue` to begin a run");
     }
 
     Ok(())
@@ -215,8 +211,8 @@ fn cmd_status(cwd: &Path) -> Result<()> {
 /// Run validators only.
 fn cmd_validate(cwd: &Path) -> Result<()> {
     let (_, path) = Config::load(cwd)?;
-    println!("Config: {}", path.display());
-    println!("Validators not yet implemented.");
+    info!(config_path = %path.display(), "config loaded");
+    info!("validators not yet implemented");
     // TODO: Implement validator execution
     Ok(())
 }
@@ -230,9 +226,10 @@ fn cmd_abort(cwd: &Path) -> Result<()> {
     let run = Run::load(cwd)?.context("No active run to abort.")?;
 
     if run.state.is_terminal() {
-        println!(
-            "Run {} is already in terminal state: {:?}",
-            run.run_id, run.state
+        info!(
+            run_id = %run.run_id,
+            state = ?run.state,
+            "run is already in terminal state"
         );
         return Ok(());
     }
@@ -245,10 +242,12 @@ fn cmd_abort(cwd: &Path) -> Result<()> {
 
     engine.abort("User requested abort")?;
 
-    println!("Aborted run: {}", engine.run().run_id);
-    println!("  Final iteration: {}", engine.run().iteration);
-    println!();
-    println!("Use `ralpher clean` to remove artifacts, or `ralpher start` for a new run.");
+    info!(
+        run_id = %engine.run().run_id,
+        final_iteration = engine.run().iteration,
+        "aborted run"
+    );
+    info!("use `ralpher clean` to remove artifacts, or `ralpher start` for a new run");
 
     Ok(())
 }
@@ -258,7 +257,7 @@ fn cmd_clean(cwd: &Path) -> Result<()> {
     let ralpher_dir = cwd.join(RALPHER_DIR);
 
     if !ralpher_dir.exists() {
-        println!("No .ralpher/ directory found. Nothing to clean.");
+        info!("no .ralpher/ directory found, nothing to clean");
         return Ok(());
     }
 
@@ -276,7 +275,7 @@ fn cmd_clean(cwd: &Path) -> Result<()> {
     std::fs::remove_dir_all(&ralpher_dir)
         .with_context(|| format!("Failed to remove {}", ralpher_dir.display()))?;
 
-    println!("Removed .ralpher/ directory.");
+    info!("removed .ralpher/ directory");
     Ok(())
 }
 
@@ -287,25 +286,21 @@ const DEFAULT_MAX_ITERATIONS: u32 = 100;
 fn run_single_iteration(engine: &mut RunEngine) -> Result<()> {
     let result = engine.next_iteration()?;
 
-    println!();
-    println!("Iteration {} completed:", engine.run().iteration);
-    println!("  Success: {}", result.success);
-    if let Some(code) = result.agent_exit_code {
-        println!("  Agent exit code: {}", code);
-    }
-    if let Some(sha) = &result.checkpoint_sha {
-        println!("  Checkpoint: {}", sha);
-    }
+    info!(
+        iteration = engine.run().iteration,
+        success = result.success,
+        agent_exit_code = ?result.agent_exit_code,
+        checkpoint = ?result.checkpoint_sha,
+        progress_pct = format!("{:.0}", engine.tasks().doneness()),
+        "iteration completed"
+    );
 
     if let Some(task) = engine.tasks().current_task() {
-        println!("  Current task: {} - {}", task.id, task.title);
+        info!(task_id = %task.id, task_title = %task.title, "current task");
     }
 
-    println!("  Progress: {:.0}%", engine.tasks().doneness());
-
     if engine.run().state == RunState::Completed {
-        println!();
-        println!("Run completed! All tasks done.");
+        info!("run completed, all tasks done");
     }
 
     Ok(())
@@ -319,11 +314,7 @@ fn run_iterations(engine: &mut RunEngine, stop_on_task_complete: bool) -> Result
     loop {
         // Check if we've hit the iteration limit
         if engine.run().iteration >= start_iteration + max_iterations {
-            println!();
-            println!(
-                "Reached maximum iterations ({}). Pausing run.",
-                max_iterations
-            );
+            warn!(max_iterations, "reached maximum iterations, pausing run");
             engine.pause()?;
             break;
         }
@@ -334,35 +325,30 @@ fn run_iterations(engine: &mut RunEngine, stop_on_task_complete: bool) -> Result
         // Run one iteration
         let result = engine.next_iteration()?;
 
-        // Print iteration summary
-        println!();
-        println!("Iteration {} completed:", engine.run().iteration);
-        println!("  Success: {}", result.success);
-        if let Some(code) = result.agent_exit_code {
-            println!("  Agent exit code: {}", code);
-        }
-        if let Some(sha) = &result.checkpoint_sha {
-            println!("  Checkpoint: {}", sha);
-        }
+        // Log iteration summary
+        info!(
+            iteration = engine.run().iteration,
+            success = result.success,
+            agent_exit_code = ?result.agent_exit_code,
+            checkpoint = ?result.checkpoint_sha,
+            progress_pct = format!("{:.0}", engine.tasks().doneness()),
+            "iteration completed"
+        );
 
         if let Some(task) = engine.tasks().current_task() {
-            println!("  Current task: {} - {}", task.id, task.title);
+            info!(task_id = %task.id, task_title = %task.title, "current task");
         }
-
-        println!("  Progress: {:.0}%", engine.tasks().doneness());
 
         // Check if run is finished
         if engine.run().state == RunState::Completed {
-            println!();
-            println!("Run completed! All tasks done.");
+            info!("run completed, all tasks done");
             break;
         }
 
         // If iteration failed, pause and let user decide
         if !result.success {
-            println!();
-            println!("Iteration failed. Pausing run.");
-            println!("Use `ralpher continue` to retry or `ralpher abort` to stop.");
+            info!("iteration failed, pausing run");
+            info!("use `ralpher continue` to retry or `ralpher abort` to stop");
             engine.pause()?;
             break;
         }
@@ -371,9 +357,8 @@ fn run_iterations(engine: &mut RunEngine, stop_on_task_complete: bool) -> Result
         if stop_on_task_complete {
             let task_after = engine.tasks().current_task().map(|t| t.id.clone());
             if task_before.is_some() && task_after != task_before {
-                println!();
-                println!("Task completed. Pausing for review.");
-                println!("Use `ralpher continue` to proceed to the next task.");
+                info!("task completed, pausing for review");
+                info!("use `ralpher continue` to proceed to the next task");
                 engine.pause()?;
                 break;
             }

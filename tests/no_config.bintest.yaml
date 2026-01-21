@@ -43,12 +43,12 @@ tests:
     steps:
       - name: run
         run:
-          cmd: "${BINARY}"
-          args: ["status"]
+          cmd: "sh"
+          args: ["-c", "RUST_LOG=info ${BINARY} status 2>&1"]
         expect:
           exit: 0
           stdout:
-            contains: "No ralpher.toml found"
+            contains: "no ralpher.toml found"
 
   - name: "abort without config fails"
     steps:
@@ -65,9 +65,9 @@ tests:
     steps:
       - name: run
         run:
-          cmd: "${BINARY}"
-          args: ["clean"]
+          cmd: "sh"
+          args: ["-c", "RUST_LOG=info ${BINARY} clean 2>&1"]
         expect:
           exit: 0
           stdout:
-            contains: "No .ralpher/ directory found"
+            contains: "no .ralpher/ directory found"
