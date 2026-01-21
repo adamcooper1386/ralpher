@@ -12,10 +12,18 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Continue an existing run or start a new one (default workflow)
-    Continue,
+    Continue {
+        /// Run only one iteration then stop (useful for testing)
+        #[arg(long)]
+        once: bool,
+    },
 
     /// Start a new run explicitly (fails if a run is already in progress)
-    Start,
+    Start {
+        /// Run only one iteration then stop (useful for testing)
+        #[arg(long)]
+        once: bool,
+    },
 
     /// Show current run status without launching TUI
     Status,

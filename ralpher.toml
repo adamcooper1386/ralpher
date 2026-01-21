@@ -5,8 +5,5 @@ git_mode = "branch"
 
 [agent]
 type = "command"
-cmd = [
-    "claude",
-    "-p",
-    "Read CLAUDE.md, then ralpher.prd.json to find the current task (first 'todo' or 'in_progress'). Implement that task following the project conventions. After completing the task, update ralpher.prd.json to mark it 'done'. Run all checks before finishing."
-]
+# Base command - ralpher will add -p with composed prompt including task context
+cmd = ["claude"]

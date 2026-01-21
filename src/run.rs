@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{Config, GitMode};
 use crate::event::{EventKind, EventLog, RunId, generate_run_id};
-use crate::task::{TaskList, TaskStatus};
+use crate::task::{Task, TaskList, TaskStatus};
 use crate::workspace::WorkspaceManager;
 
 const RALPHER_DIR: &str = ".ralpher";
@@ -16,6 +16,22 @@ const RUN_FILE: &str = "run.json";
 const EVENTS_FILE: &str = "events.ndjson";
 const ITERATIONS_DIR: &str = "iterations";
 const AGENT_LOG_FILE: &str = "agent.log";
+const TASK_UPDATE_FILE: &str = "task_update.json";
+
+/// Task update written by the agent to report progress.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TaskUpdate {
+    /// ID of the task being updated.
+    pub task_id: String,
+    /// New status for the task.
+    pub new_status: TaskStatus,
+    /// Optional notes about the update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    /// Optional evidence (paths changed, commands run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Vec<String>>,
+}
 
 /// State of a ralpher run.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
@@ -323,6 +339,7 @@ impl RunEngine {
         {
             let old_status = t.status;
             t.status = TaskStatus::InProgress;
+            self.tasks.save()?;
             self.event_log.emit_now(EventKind::TaskStatusChanged {
                 run_id: self.run.run_id.clone(),
                 task_id: task.id.clone(),
@@ -332,7 +349,7 @@ impl RunEngine {
         }
 
         // Execute agent command
-        let agent_exit_code = match self.execute_agent(&task.id, &task.title) {
+        let agent_exit_code = match self.execute_agent(&task) {
             Ok(code) => Some(code),
             Err(e) => {
                 // Log the error but don't fail the run - treat as agent failure
@@ -347,16 +364,67 @@ impl RunEngine {
             exit_code: agent_exit_code,
         })?;
 
+        // Parse task update from agent
+        if let Some(update) = self.parse_task_update()
+            && let Some(t) = self.tasks.get_mut(&update.task_id)
+        {
+            let old_status = t.status;
+            t.status = update.new_status;
+            if let Some(notes) = update.notes {
+                t.notes = Some(notes);
+            }
+            self.tasks.save()?;
+
+            self.event_log.emit_now(EventKind::TaskStatusChanged {
+                run_id: self.run.run_id.clone(),
+                task_id: update.task_id,
+                old_status,
+                new_status: update.new_status,
+            })?;
+        }
+
         // TODO: Run validators (for now, simulate pass)
         let validators_passed = true;
 
-        // Emit IterationCompleted
+        // Determine success and create checkpoint if appropriate
         let success = agent_exit_code == Some(0) && validators_passed;
+        let mut checkpoint_sha = None;
+
+        // Create checkpoint if iteration was successful and there are changes
+        if success {
+            // Check if there are any staged or unstaged changes to commit
+            let has_changes = self.workspace.is_dirty().unwrap_or(false);
+            if has_changes {
+                // Stage all changes
+                Command::new("git")
+                    .args(["add", "-A"])
+                    .current_dir(&self.repo_path)
+                    .output()
+                    .ok();
+
+                // Create checkpoint commit
+                match self.checkpoint(&task.id, &task.title) {
+                    Ok(sha) => {
+                        checkpoint_sha = Some(sha);
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to create checkpoint: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Emit IterationCompleted
         self.event_log.emit_now(EventKind::IterationCompleted {
             run_id: self.run.run_id.clone(),
             iteration: self.run.iteration,
             success,
         })?;
+
+        // Check if all tasks are now done
+        if self.tasks.is_complete() {
+            self.complete()?;
+        }
 
         // Save state
         self.run.save(&self.repo_path)?;
@@ -365,7 +433,7 @@ impl RunEngine {
             success,
             agent_exit_code,
             validators_passed,
-            checkpoint_sha: None,
+            checkpoint_sha,
         })
     }
 
@@ -377,9 +445,57 @@ impl RunEngine {
             .join(iteration.to_string())
     }
 
-    /// Execute the configured agent command.
+    /// Get the path to the task_update.json file.
+    fn task_update_path(&self) -> PathBuf {
+        self.repo_path.join(RALPHER_DIR).join(TASK_UPDATE_FILE)
+    }
+
+    /// Compose the prompt for the agent with task context.
+    fn compose_prompt(&self, task: &Task) -> String {
+        let mut prompt = String::new();
+
+        // Task context
+        prompt.push_str("# Current Task\n\n");
+        prompt.push_str(&format!("**Task ID:** {}\n", task.id));
+        prompt.push_str(&format!("**Title:** {}\n\n", task.title));
+
+        // Acceptance criteria
+        if !task.acceptance.is_empty() {
+            prompt.push_str("**Acceptance Criteria:**\n");
+            for criterion in &task.acceptance {
+                prompt.push_str(&format!("- {}\n", criterion));
+            }
+            prompt.push('\n');
+        }
+
+        // Notes
+        if let Some(notes) = &task.notes {
+            prompt.push_str(&format!("**Notes:** {}\n\n", notes));
+        }
+
+        // Instructions
+        prompt.push_str("# Instructions\n\n");
+        prompt.push_str("1. Read CLAUDE.md to understand project conventions.\n");
+        prompt.push_str("2. Implement the task above following the acceptance criteria.\n");
+        prompt.push_str("3. Run all checks: `cargo fmt && cargo check && cargo clippy -- -D warnings && cargo test`\n");
+        prompt.push_str(
+            "4. When the task is complete, write a file `.ralpher/task_update.json` with:\n",
+        );
+        prompt.push_str("   ```json\n");
+        prompt.push_str("   {\n");
+        prompt.push_str(&format!("     \"task_id\": \"{}\",\n", task.id));
+        prompt.push_str("     \"new_status\": \"done\",\n");
+        prompt.push_str("     \"notes\": \"Brief description of what was done\"\n");
+        prompt.push_str("   }\n");
+        prompt.push_str("   ```\n");
+        prompt.push_str("5. If blocked, set new_status to \"blocked\" and explain in notes.\n");
+
+        prompt
+    }
+
+    /// Execute the configured agent command with composed prompt.
     /// Returns the exit code (0 = success, non-zero = failure).
-    fn execute_agent(&self, task_id: &str, task_title: &str) -> Result<i32> {
+    fn execute_agent(&self, task: &Task) -> Result<i32> {
         let agent_config = self.config.agent.as_ref().context(
             "No agent configured in ralpher.toml. Add [agent] section with type and cmd.",
         )?;
@@ -397,6 +513,15 @@ impl RunEngine {
             )
         })?;
 
+        // Remove any existing task_update.json from previous iteration
+        let task_update_path = self.task_update_path();
+        if task_update_path.exists() {
+            fs::remove_file(&task_update_path).ok();
+        }
+
+        // Compose the prompt
+        let prompt = self.compose_prompt(task);
+
         // Open log file for agent output
         let log_path = iter_dir.join(AGENT_LOG_FILE);
         let mut log_file = File::create(&log_path)
@@ -405,17 +530,22 @@ impl RunEngine {
         // Write header to log
         writeln!(
             log_file,
-            "=== ralpher agent execution ===\nIteration: {}\nTask: {} - {}\nCommand: {:?}\n",
-            self.run.iteration, task_id, task_title, agent_config.cmd
+            "=== ralpher agent execution ===\nIteration: {}\nTask: {} - {}\nCommand: {:?}\n\n=== Prompt ===\n{}\n",
+            self.run.iteration, task.id, task.title, agent_config.cmd, prompt
         )?;
 
-        // Build the command
+        // Build the command - use the base command and add -p with our prompt
         let program = &agent_config.cmd[0];
-        let args = &agent_config.cmd[1..];
+        let mut args: Vec<&str> = agent_config.cmd[1..].iter().map(|s| s.as_str()).collect();
+
+        // Add -p flag with composed prompt
+        args.push("-p");
+        let prompt_ref = prompt.as_str();
 
         // Execute the command
         let output = Command::new(program)
-            .args(args)
+            .args(&args)
+            .arg(prompt_ref)
             .current_dir(&self.repo_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -441,6 +571,18 @@ impl RunEngine {
         writeln!(log_file, "=== exit code: {} ===", exit_code)?;
 
         Ok(exit_code)
+    }
+
+    /// Parse task_update.json written by the agent.
+    /// Returns None if the file doesn't exist or can't be parsed.
+    fn parse_task_update(&self) -> Option<TaskUpdate> {
+        let path = self.task_update_path();
+        if !path.exists() {
+            return None;
+        }
+
+        let content = fs::read_to_string(&path).ok()?;
+        serde_json::from_str(&content).ok()
     }
 
     /// Update a task's status and emit an event.
@@ -642,7 +784,7 @@ mod tests {
             }),
         };
 
-        // Create task list with sample tasks
+        // Create task list with sample tasks and save to disk
         let tasks = TaskList::new(vec![
             Task {
                 id: "task-1".to_string(),
@@ -661,6 +803,25 @@ mod tests {
                 notes: None,
             },
         ]);
+
+        // Save tasks to disk so they have an associated path
+        let task_path = dir.path().join("ralpher.prd.json");
+        tasks.save_to(&task_path).unwrap();
+
+        // Commit the task file so the working tree is clean
+        Command::new("git")
+            .args(["add", "ralpher.prd.json"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Add task file"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        // Load tasks back so they have the path set
+        let tasks = TaskList::load(dir.path()).unwrap();
 
         (dir, config, tasks)
     }

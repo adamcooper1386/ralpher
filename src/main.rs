@@ -14,8 +14,8 @@ fn main() -> Result<()> {
     let cwd = env::current_dir()?;
 
     match cli.command {
-        Command::Continue => cmd_continue(&cwd)?,
-        Command::Start => cmd_start(&cwd)?,
+        Command::Continue { once } => cmd_continue(&cwd, once)?,
+        Command::Start { once } => cmd_start(&cwd, once)?,
         Command::Status => cmd_status(&cwd)?,
         Command::Validate => cmd_validate(&cwd)?,
         Command::Abort => cmd_abort(&cwd)?,
@@ -26,7 +26,7 @@ fn main() -> Result<()> {
 }
 
 /// Continue an existing run or start a new one.
-fn cmd_continue(cwd: &Path) -> Result<()> {
+fn cmd_continue(cwd: &Path, once: bool) -> Result<()> {
     let (config, _) = Config::load(cwd)?;
     let tasks = TaskList::load(cwd)?;
 
@@ -58,8 +58,12 @@ fn cmd_continue(cwd: &Path) -> Result<()> {
             }
         }
 
-        // Run one iteration (headless mode)
-        run_iteration(&mut engine)?;
+        // Run iterations
+        if once {
+            run_single_iteration(&mut engine)?;
+        } else {
+            run_iterations(&mut engine)?;
+        }
     } else {
         // No existing run, start a new one
         println!("No existing run found. Starting new run...");
@@ -71,15 +75,19 @@ fn cmd_continue(cwd: &Path) -> Result<()> {
             engine.run().run_branch
         );
 
-        // Run one iteration
-        run_iteration(&mut engine)?;
+        // Run iterations
+        if once {
+            run_single_iteration(&mut engine)?;
+        } else {
+            run_iterations(&mut engine)?;
+        }
     }
 
     Ok(())
 }
 
 /// Start a new run explicitly.
-fn cmd_start(cwd: &Path) -> Result<()> {
+fn cmd_start(cwd: &Path, once: bool) -> Result<()> {
     let (config, _) = Config::load(cwd)?;
     let tasks = TaskList::load(cwd)?;
 
@@ -112,8 +120,12 @@ fn cmd_start(cwd: &Path) -> Result<()> {
     println!("  Tasks: {}", engine.tasks().tasks.len());
     println!();
 
-    // Run one iteration
-    run_iteration(&mut engine)?;
+    // Run iterations
+    if once {
+        run_single_iteration(&mut engine)?;
+    } else {
+        run_iterations(&mut engine)?;
+    }
 
     Ok(())
 }
@@ -257,26 +269,90 @@ fn cmd_clean(cwd: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Run a single iteration and print the result.
-fn run_iteration(engine: &mut RunEngine) -> Result<()> {
-    let result = engine.next_iteration()?;
+/// Default maximum iterations before stopping.
+const DEFAULT_MAX_ITERATIONS: u32 = 100;
 
-    if engine.run().state == RunState::Completed {
-        println!();
-        println!("Run completed! All tasks done.");
-        return Ok(());
-    }
+/// Run a single iteration and print the result.
+fn run_single_iteration(engine: &mut RunEngine) -> Result<()> {
+    let result = engine.next_iteration()?;
 
     println!();
     println!("Iteration {} completed:", engine.run().iteration);
     println!("  Success: {}", result.success);
-    println!("  Validators passed: {}", result.validators_passed);
+    if let Some(code) = result.agent_exit_code {
+        println!("  Agent exit code: {}", code);
+    }
+    if let Some(sha) = &result.checkpoint_sha {
+        println!("  Checkpoint: {}", sha);
+    }
 
     if let Some(task) = engine.tasks().current_task() {
         println!("  Current task: {} - {}", task.id, task.title);
     }
 
     println!("  Progress: {:.0}%", engine.tasks().doneness());
+
+    if engine.run().state == RunState::Completed {
+        println!();
+        println!("Run completed! All tasks done.");
+    }
+
+    Ok(())
+}
+
+/// Run iterations until completion, max iterations, or failure.
+fn run_iterations(engine: &mut RunEngine) -> Result<()> {
+    let max_iterations = DEFAULT_MAX_ITERATIONS;
+    let start_iteration = engine.run().iteration;
+
+    loop {
+        // Check if we've hit the iteration limit
+        if engine.run().iteration >= start_iteration + max_iterations {
+            println!();
+            println!(
+                "Reached maximum iterations ({}). Pausing run.",
+                max_iterations
+            );
+            engine.pause()?;
+            break;
+        }
+
+        // Run one iteration
+        let result = engine.next_iteration()?;
+
+        // Print iteration summary
+        println!();
+        println!("Iteration {} completed:", engine.run().iteration);
+        println!("  Success: {}", result.success);
+        if let Some(code) = result.agent_exit_code {
+            println!("  Agent exit code: {}", code);
+        }
+        if let Some(sha) = &result.checkpoint_sha {
+            println!("  Checkpoint: {}", sha);
+        }
+
+        if let Some(task) = engine.tasks().current_task() {
+            println!("  Current task: {} - {}", task.id, task.title);
+        }
+
+        println!("  Progress: {:.0}%", engine.tasks().doneness());
+
+        // Check if run is finished
+        if engine.run().state == RunState::Completed {
+            println!();
+            println!("Run completed! All tasks done.");
+            break;
+        }
+
+        // If iteration failed, pause and let user decide
+        if !result.success {
+            println!();
+            println!("Iteration failed. Pausing run.");
+            println!("Use `ralpher continue` to retry or `ralpher abort` to stop.");
+            engine.pause()?;
+            break;
+        }
+    }
 
     Ok(())
 }
