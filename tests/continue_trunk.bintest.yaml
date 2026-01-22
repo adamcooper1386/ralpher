@@ -6,7 +6,7 @@ sandbox:
   inherit_env: true
 
 tests:
-  - name: "continue with trunk mode and no task file fails"
+  - name: "iteration with trunk mode and no task file fails"
     setup:
       - write_file:
           path: "ralpher.toml"
@@ -16,7 +16,7 @@ tests:
       - name: run
         run:
           cmd: "${BINARY}"
-          args: ["continue"]
+          args: ["--iteration"]
         expect:
           exit: 1
           stderr:

@@ -16,7 +16,7 @@ tests:
       - name: run
         run:
           cmd: "sh"
-          args: ["-c", "RUST_LOG=info ${BINARY} validate 2>&1"]
+          args: ["-c", "RUST_LOG=info ${BINARY} --validate 2>&1"]
         expect:
           exit: 0
           stdout:

@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::Parser;
 
 /// A TUI that cooks AI development plans to completion via iterative Ralph loops.
 #[derive(Parser, Debug)]
@@ -9,51 +9,35 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "LEVEL")]
     pub log_level: Option<String>,
 
-    #[command(subcommand)]
-    pub command: Command,
+    /// Run one iteration and exit (CLI mode)
+    #[arg(long)]
+    pub iteration: bool,
+
+    /// Show current run status and exit
+    #[arg(long)]
+    pub status: bool,
+
+    /// Run validators only and exit
+    #[arg(long)]
+    pub validate: bool,
+
+    /// Abort the current run and exit
+    #[arg(long)]
+    pub abort: bool,
+
+    /// Remove .ralpher/ artifacts and exit
+    #[arg(long)]
+    pub clean: bool,
+
+    /// Start a new run and exit (fails if one is in progress)
+    #[arg(long)]
+    pub start: bool,
 }
 
-#[derive(Subcommand, Debug)]
-pub enum Command {
-    /// Continue an existing run or start a new one (default workflow)
-    Continue {
-        /// Run only one iteration then stop (useful for testing)
-        #[arg(long)]
-        once: bool,
-
-        /// Stop after the current task completes (for reviewing changes)
-        #[arg(long)]
-        task: bool,
-
-        /// Run without TUI (headless mode with log output only)
-        #[arg(long)]
-        headless: bool,
-    },
-
-    /// Start a new run explicitly (fails if a run is already in progress)
-    Start {
-        /// Run only one iteration then stop (useful for testing)
-        #[arg(long)]
-        once: bool,
-
-        /// Stop after the current task completes (for reviewing changes)
-        #[arg(long)]
-        task: bool,
-
-        /// Run without TUI (headless mode with log output only)
-        #[arg(long)]
-        headless: bool,
-    },
-
-    /// Show current run status without launching TUI
-    Status,
-
-    /// Run validators only (no agent execution)
-    Validate,
-
-    /// Abort the current run (keeps artifacts)
-    Abort,
-
-    /// Remove temporary artifacts (keeps PRD and config)
-    Clean,
+impl Cli {
+    /// Check if any CLI mode flag is set.
+    /// When no flags are set, the TUI should be launched.
+    pub fn is_cli_mode(&self) -> bool {
+        self.iteration || self.status || self.validate || self.abort || self.clean || self.start
+    }
 }

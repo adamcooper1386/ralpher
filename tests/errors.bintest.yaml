@@ -6,13 +6,13 @@ sandbox:
   inherit_env: true
 
 tests:
-  - name: "unknown subcommand fails"
+  - name: "unknown flag fails"
     steps:
       - name: run
         run:
           cmd: "${BINARY}"
-          args: ["unknown"]
+          args: ["--unknown-flag"]
         expect:
           exit: 2
           stderr:
-            contains: "unrecognized subcommand"
+            contains: "unexpected argument"

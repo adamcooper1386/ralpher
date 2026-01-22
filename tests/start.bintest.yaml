@@ -16,7 +16,7 @@ tests:
       - name: run
         run:
           cmd: "${BINARY}"
-          args: ["start"]
+          args: ["--start"]
         expect:
           exit: 1
           stderr:

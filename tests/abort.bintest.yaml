@@ -20,7 +20,7 @@ tests:
       - name: run
         run:
           cmd: "${BINARY}"
-          args: ["abort"]
+          args: ["--abort"]
         expect:
           exit: 1
           stderr:

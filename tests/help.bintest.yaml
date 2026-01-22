@@ -28,68 +28,68 @@ tests:
           stdout:
             contains: "ralpher"
 
-  - name: "subcommand help - continue"
+  - name: "help shows --status flag"
     steps:
       - name: run
         run:
           cmd: "${BINARY}"
-          args: ["continue", "--help"]
+          args: ["--help"]
         expect:
           exit: 0
           stdout:
-            contains: "Continue an existing run"
+            contains: "--status"
 
-  - name: "subcommand help - start"
+  - name: "help shows --validate flag"
     steps:
       - name: run
         run:
           cmd: "${BINARY}"
-          args: ["start", "--help"]
+          args: ["--help"]
         expect:
           exit: 0
           stdout:
-            contains: "Start a new run"
+            contains: "--validate"
 
-  - name: "subcommand help - status"
+  - name: "help shows --abort flag"
     steps:
       - name: run
         run:
           cmd: "${BINARY}"
-          args: ["status", "--help"]
+          args: ["--help"]
         expect:
           exit: 0
           stdout:
-            contains: "Show current run status"
+            contains: "--abort"
 
-  - name: "subcommand help - validate"
+  - name: "help shows --clean flag"
     steps:
       - name: run
         run:
           cmd: "${BINARY}"
-          args: ["validate", "--help"]
+          args: ["--help"]
         expect:
           exit: 0
           stdout:
-            contains: "Run validators only"
+            contains: "--clean"
 
-  - name: "subcommand help - abort"
+  - name: "help shows --start flag"
     steps:
       - name: run
         run:
           cmd: "${BINARY}"
-          args: ["abort", "--help"]
+          args: ["--help"]
         expect:
           exit: 0
           stdout:
-            contains: "Abort the current run"
+            contains: "--start"
 
-  - name: "subcommand help - clean"
+  - name: "help shows --iteration flag"
     steps:
       - name: run
         run:
           cmd: "${BINARY}"
-          args: ["clean", "--help"]
+          args: ["--help"]
         expect:
           exit: 0
           stdout:
-            contains: "Remove temporary artifacts"
+            contains: "--iteration"
