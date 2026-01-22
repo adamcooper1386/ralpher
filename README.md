@@ -29,7 +29,7 @@ cargo install ralpher
 Or build from source:
 
 ```bash
-git clone https://github.com/yourusername/ralpher.git
+git clone https://github.com/adamcooper1386/ralpher.git
 cd ralpher
 cargo build --release
 ```
