@@ -3,6 +3,7 @@ pub mod config;
 pub mod engine;
 pub mod event;
 pub mod policy;
+pub mod prd_parser;
 pub mod run;
 pub mod task;
 pub mod tui;

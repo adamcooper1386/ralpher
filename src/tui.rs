@@ -24,6 +24,7 @@ use tracing::{debug, info, warn};
 use crate::config::{Config, GitMode};
 use crate::engine;
 use crate::event::Event;
+use crate::prd_parser;
 use crate::run::{Run, RunEngine, RunState};
 use crate::task::{Task, TaskList, TaskStatus};
 
@@ -194,6 +195,13 @@ impl App {
 
     /// Create a new TUI app in setup mode (no config found).
     pub fn new_setup(repo_path: impl AsRef<Path>, detected: DetectedFiles) -> Self {
+        // Try to import tasks from PRD file if detected
+        let imported_tasks = if let Some(prd_path) = &detected.prd {
+            prd_parser::parse_prd_file(prd_path).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         Self {
             repo_path: repo_path.as_ref().to_path_buf(),
             mode: TuiMode::Setup,
@@ -202,7 +210,7 @@ impl App {
                 detected,
                 agent_cmd: "claude --print".to_string(), // sensible default
                 git_mode: GitMode::Branch,
-                tasks: Vec::new(),
+                tasks: imported_tasks,
                 focused_field: 0,
             },
             run: None,
@@ -697,11 +705,9 @@ pub fn run(repo_path: &Path) -> Result<()> {
 
     loop {
         // Draw UI based on mode
-        terminal.draw(|f| {
-            match app.mode {
-                TuiMode::Setup => draw_setup_ui(f, &app),
-                TuiMode::Normal => draw_ui(f, &app),
-            }
+        terminal.draw(|f| match app.mode {
+            TuiMode::Setup => draw_setup_ui(f, &app),
+            TuiMode::Normal => draw_ui(f, &app),
         })?;
 
         // Handle input
@@ -814,7 +820,11 @@ pub fn run(repo_path: &Path) -> Result<()> {
 }
 
 /// Handle input in setup mode.
-fn handle_setup_input(app: &mut App, key: crossterm::event::KeyEvent, repo_path: &Path) -> Result<()> {
+fn handle_setup_input(
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+    repo_path: &Path,
+) -> Result<()> {
     use crossterm::event::KeyCode;
 
     match key.code {
@@ -895,6 +905,18 @@ fn handle_setup_input(app: &mut App, key: crossterm::event::KeyEvent, repo_path:
                 validators: vec![],
                 notes: None,
             });
+        }
+        KeyCode::Char('i') if app.setup.step == SetupStep::Tasks => {
+            // Re-import tasks from PRD file
+            if let Some(prd_path) = &app.setup.detected.prd
+                && let Ok(tasks) = prd_parser::parse_prd_file(prd_path)
+            {
+                app.setup.tasks = tasks;
+            }
+        }
+        KeyCode::Char('c') if app.setup.step == SetupStep::Tasks => {
+            // Clear all tasks
+            app.setup.tasks.clear();
         }
         KeyCode::Char(c) => {
             // Text input for agent command
@@ -1157,10 +1179,10 @@ fn draw_setup_ui(f: &mut ratatui::Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Header
-            Constraint::Min(10),    // Main content
-            Constraint::Length(3),  // Detected files
-            Constraint::Length(1),  // Footer
+            Constraint::Length(3), // Header
+            Constraint::Min(10),   // Main content
+            Constraint::Length(3), // Detected files
+            Constraint::Length(1), // Footer
         ])
         .split(size);
 
@@ -1181,9 +1203,17 @@ fn draw_setup_ui(f: &mut ratatui::Frame, app: &App) {
     };
 
     let header = Paragraph::new(Line::from(vec![
-        Span::styled(" ralpher setup ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " ralpher setup ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" - "),
-        Span::styled(format!("Step {}/5: {}", step_num, step_name), Style::default().fg(Color::Yellow)),
+        Span::styled(
+            format!("Step {}/5: {}", step_num, step_name),
+            Style::default().fg(Color::Yellow),
+        ),
     ]))
     .block(Block::default().borders(Borders::ALL));
 
@@ -1200,7 +1230,13 @@ fn draw_setup_ui(f: &mut ratatui::Frame, app: &App) {
         SetupStep::Welcome => " Enter: Continue  |  q: Quit ",
         SetupStep::AgentConfig => " Enter: Continue  |  Backspace: Back  |  q: Quit ",
         SetupStep::GitMode => " Tab: Toggle  |  Enter: Continue  |  Backspace: Back  |  q: Quit ",
-        SetupStep::Tasks => " n: New Task  |  Enter: Continue  |  Backspace: Back  |  q: Quit ",
+        SetupStep::Tasks => {
+            if app.setup.detected.prd.is_some() {
+                " n: New  |  i: Re-import  |  c: Clear  |  Enter: Continue  |  Backspace: Back  |  q: Quit "
+            } else {
+                " n: New Task  |  Enter: Continue  |  Backspace: Back  |  q: Quit "
+            }
+        }
         SetupStep::Review => " Enter: Save & Start  |  Backspace: Back  |  q: Quit ",
     };
     let footer = Paragraph::new(footer_text).style(Style::default().fg(Color::DarkGray));
@@ -1215,7 +1251,9 @@ fn draw_setup_step(f: &mut ratatui::Frame, app: &App, area: Rect) {
                 Line::from(""),
                 Line::from(Span::styled(
                     "Welcome to ralpher!",
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
                 Line::from("No ralpher.toml configuration found in this directory."),
@@ -1246,24 +1284,44 @@ fn draw_setup_step(f: &mut ratatui::Frame, app: &App, area: Rect) {
                     Style::default().fg(Color::Cyan),
                 )),
                 Line::from(""),
-                Line::from(Span::styled("Examples:", Style::default().fg(Color::DarkGray))),
-                Line::from(Span::styled("  claude --print", Style::default().fg(Color::DarkGray))),
-                Line::from(Span::styled("  aider --message", Style::default().fg(Color::DarkGray))),
-                Line::from(Span::styled("  codex run", Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled(
+                    "Examples:",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    "  claude --print",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    "  aider --message",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    "  codex run",
+                    Style::default().fg(Color::DarkGray),
+                )),
             ];
             let para = Paragraph::new(text)
-                .block(Block::default().borders(Borders::ALL).title(" Agent Command "))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Agent Command "),
+                )
                 .wrap(Wrap { trim: true });
             f.render_widget(para, area);
         }
         SetupStep::GitMode => {
             let branch_style = if app.setup.git_mode == GitMode::Branch {
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
             let trunk_style = if app.setup.git_mode == GitMode::Trunk {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
@@ -1297,13 +1355,51 @@ fn draw_setup_step(f: &mut ratatui::Frame, app: &App, area: Rect) {
         SetupStep::Tasks => {
             let mut lines = vec![
                 Line::from(""),
-                Line::from("Tasks to complete (optional):"),
+                Line::from("Tasks to complete:"),
                 Line::from(""),
             ];
 
-            if app.setup.tasks.is_empty() {
+            // Show import status
+            if app.setup.detected.prd.is_some() {
+                if app.setup.tasks.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "  PRD file detected but no user stories found.",
+                        Style::default().fg(Color::Yellow),
+                    )));
+                    lines.push(Line::from(Span::styled(
+                        "  Press 'n' to add tasks manually.",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {} tasks imported from PRD:", app.setup.tasks.len()),
+                        Style::default().fg(Color::Green),
+                    )));
+                    lines.push(Line::from(""));
+                    for (i, task) in app.setup.tasks.iter().enumerate() {
+                        let acceptance_count = task.acceptance.len();
+                        let suffix = if acceptance_count > 0 {
+                            format!(" ({} criteria)", acceptance_count)
+                        } else {
+                            String::new()
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                format!("  {}. ", i + 1),
+                                Style::default().fg(Color::Cyan),
+                            ),
+                            Span::raw(&task.title),
+                            Span::styled(suffix, Style::default().fg(Color::DarkGray)),
+                        ]));
+                    }
+                }
+            } else if app.setup.tasks.is_empty() {
                 lines.push(Line::from(Span::styled(
-                    "  No tasks yet. Press 'n' to add a task, or continue without tasks.",
+                    "  No PRD file detected and no tasks yet.",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "  Press 'n' to add tasks manually, or continue without tasks.",
                     Style::default().fg(Color::DarkGray),
                 )));
             } else {
@@ -1314,7 +1410,7 @@ fn draw_setup_step(f: &mut ratatui::Frame, app: &App, area: Rect) {
 
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "You can add more tasks later from the TUI.",
+                "You can edit tasks later from the TUI.",
                 Style::default().fg(Color::DarkGray),
             )));
 
@@ -1331,15 +1427,24 @@ fn draw_setup_step(f: &mut ratatui::Frame, app: &App, area: Rect) {
 
             let text = vec![
                 Line::from(""),
-                Line::from(Span::styled("Configuration Summary:", Style::default().add_modifier(Modifier::BOLD))),
+                Line::from(Span::styled(
+                    "Configuration Summary:",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
                 Line::from(""),
                 Line::from(format!("  Agent command: {}", app.setup.agent_cmd)),
                 Line::from(format!("  Git mode: {}", git_mode_str)),
                 Line::from(format!("  Tasks: {}", app.setup.tasks.len())),
                 Line::from(""),
                 Line::from("Files to be created:"),
-                Line::from(Span::styled("  - ralpher.toml", Style::default().fg(Color::Green))),
-                Line::from(Span::styled("  - ralpher.prd.json", Style::default().fg(Color::Green))),
+                Line::from(Span::styled(
+                    "  - ralpher.toml",
+                    Style::default().fg(Color::Green),
+                )),
+                Line::from(Span::styled(
+                    "  - ralpher.prd.json",
+                    Style::default().fg(Color::Green),
+                )),
                 Line::from(""),
                 Line::from(Span::styled(
                     "Press Enter to save and start ralpher...",
@@ -1362,7 +1467,10 @@ fn draw_detected_files(f: &mut ratatui::Frame, app: &App, area: Rect) {
         spans.push(Span::styled("git ", Style::default().fg(Color::Green)));
     }
     if app.setup.detected.mission.is_some() {
-        spans.push(Span::styled("mission.md ", Style::default().fg(Color::Cyan)));
+        spans.push(Span::styled(
+            "mission.md ",
+            Style::default().fg(Color::Cyan),
+        ));
     }
     if app.setup.detected.prd.is_some() {
         spans.push(Span::styled("prd.md ", Style::default().fg(Color::Cyan)));
@@ -1371,15 +1479,20 @@ fn draw_detected_files(f: &mut ratatui::Frame, app: &App, area: Rect) {
         spans.push(Span::styled("tech.md ", Style::default().fg(Color::Cyan)));
     }
     if app.setup.detected.task_file.is_some() {
-        spans.push(Span::styled("ralpher.prd.json ", Style::default().fg(Color::Yellow)));
+        spans.push(Span::styled(
+            "ralpher.prd.json ",
+            Style::default().fg(Color::Yellow),
+        ));
     }
 
     if spans.len() == 1 {
-        spans.push(Span::styled("(no product files found)", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            "(no product files found)",
+            Style::default().fg(Color::DarkGray),
+        ));
     }
 
-    let para = Paragraph::new(Line::from(spans))
-        .block(Block::default().borders(Borders::ALL));
+    let para = Paragraph::new(Line::from(spans)).block(Block::default().borders(Borders::ALL));
     f.render_widget(para, area);
 }
 
@@ -1442,17 +1555,23 @@ fn draw_task_editor_overlay(f: &mut ratatui::Frame, app: &App, size: Rect) {
     let focused = app.edit_buffer.focused_field;
 
     let title_style = if focused == 0 {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
     let acceptance_style = if focused == 1 {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
     let notes_style = if focused == 2 {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
@@ -1478,11 +1597,17 @@ fn draw_task_editor_overlay(f: &mut ratatui::Frame, app: &App, size: Rect) {
         Line::from(Span::styled("Title:", title_style)),
         Line::from(Span::styled(format!("  {}", title_text), title_style)),
         Line::from(""),
-        Line::from(Span::styled("Acceptance Criteria (one per line):", acceptance_style)),
+        Line::from(Span::styled(
+            "Acceptance Criteria (one per line):",
+            acceptance_style,
+        )),
     ];
 
     for line in acceptance_text.lines() {
-        lines.push(Line::from(Span::styled(format!("  {}", line), acceptance_style)));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", line),
+            acceptance_style,
+        )));
     }
     if acceptance_text.is_empty() || acceptance_text.ends_with('\n') {
         lines.push(Line::from(Span::styled("  ", acceptance_style)));

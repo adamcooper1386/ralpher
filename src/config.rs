@@ -192,8 +192,8 @@ impl Config {
     /// Create a config from setup wizard input.
     pub fn from_setup(agent_cmd: &str, git_mode: GitMode) -> Self {
         // Parse the command string into parts
-        let cmd: Vec<String> = shell_words::split(agent_cmd)
-            .unwrap_or_else(|_| vec![agent_cmd.to_string()]);
+        let cmd: Vec<String> =
+            shell_words::split(agent_cmd).unwrap_or_else(|_| vec![agent_cmd.to_string()]);
 
         Self {
             git_mode,
