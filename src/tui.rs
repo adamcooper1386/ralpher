@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event as CrosstermEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -21,11 +21,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Wrap};
 use tracing::{debug, info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, GitMode};
 use crate::engine;
 use crate::event::Event;
 use crate::run::{Run, RunEngine, RunState};
-use crate::task::{TaskList, TaskStatus};
+use crate::task::{Task, TaskList, TaskStatus};
 
 /// Log source selection for the log panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -37,10 +37,101 @@ pub enum LogSource {
     Validator,
 }
 
+/// TUI operating mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TuiMode {
+    /// Normal operation mode with config loaded.
+    #[default]
+    Normal,
+    /// Setup mode - no config found, guide user through setup.
+    Setup,
+}
+
+/// Setup wizard step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SetupStep {
+    /// Welcome screen showing detected files.
+    #[default]
+    Welcome,
+    /// Configure the AI agent command.
+    AgentConfig,
+    /// Select git mode (branch/trunk).
+    GitMode,
+    /// Import or create tasks.
+    Tasks,
+    /// Review and save configuration.
+    Review,
+}
+
+/// Edit mode for task CRUD operations.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EditMode {
+    /// No editing in progress.
+    #[default]
+    None,
+    /// Creating a new task.
+    NewTask,
+    /// Editing an existing task.
+    EditingTask(String), // task ID being edited
+    /// Confirming task deletion.
+    ConfirmDelete(String), // task ID to delete
+}
+
+/// Detected product files in the directory.
+#[derive(Debug, Clone, Default)]
+pub struct DetectedFiles {
+    /// Mission file (mission.md or product/mission.md).
+    pub mission: Option<std::path::PathBuf>,
+    /// PRD file (prd.md or product/prd.md).
+    pub prd: Option<std::path::PathBuf>,
+    /// Tech file (tech.md or product/tech.md).
+    pub tech: Option<std::path::PathBuf>,
+    /// Existing ralpher.prd.json.
+    pub task_file: Option<std::path::PathBuf>,
+    /// Whether this is a git repository.
+    pub is_git_repo: bool,
+}
+
+/// Task being edited (buffer for in-progress edits).
+#[derive(Debug, Clone, Default)]
+pub struct TaskEditBuffer {
+    /// Task ID (generated for new tasks, existing for edits).
+    pub id: String,
+    /// Task title.
+    pub title: String,
+    /// Acceptance criteria (one per line in editor).
+    pub acceptance: String,
+    /// Notes.
+    pub notes: String,
+    /// Which field is currently focused.
+    pub focused_field: usize,
+}
+
+/// Setup wizard state.
+#[derive(Debug, Clone, Default)]
+pub struct SetupState {
+    /// Current step in the wizard.
+    pub step: SetupStep,
+    /// Detected files in the directory.
+    pub detected: DetectedFiles,
+    /// Agent command being configured.
+    pub agent_cmd: String,
+    /// Selected git mode.
+    pub git_mode: crate::config::GitMode,
+    /// Tasks being created/imported.
+    pub tasks: Vec<crate::task::Task>,
+    /// Currently focused field in current step.
+    pub focused_field: usize,
+}
+
 /// TUI application state.
 pub struct App {
     /// Path to the repository root.
     repo_path: PathBuf,
+    /// Current TUI operating mode.
+    mode: TuiMode,
+    /// Setup wizard state (only used in Setup mode).
+    setup: SetupState,
     /// Current run state (loaded from run.json).
     run: Option<Run>,
     /// Task list (loaded from ralpher.prd.json).
@@ -67,13 +158,21 @@ pub struct App {
     last_interaction: Instant,
     /// Whether iterations are paused by user.
     user_paused: bool,
+    /// Currently selected task index in task list.
+    selected_task_index: usize,
+    /// Current edit mode for task CRUD.
+    edit_mode: EditMode,
+    /// Buffer for task being edited.
+    edit_buffer: TaskEditBuffer,
 }
 
 impl App {
-    /// Create a new TUI app.
+    /// Create a new TUI app in normal mode.
     pub fn new(repo_path: impl AsRef<Path>, run: Option<Run>, tasks: TaskList) -> Self {
         Self {
             repo_path: repo_path.as_ref().to_path_buf(),
+            mode: TuiMode::Normal,
+            setup: SetupState::default(),
             run,
             tasks,
             events: Vec::new(),
@@ -87,6 +186,41 @@ impl App {
             log_scroll_offset: 0,
             last_interaction: Instant::now(),
             user_paused: false,
+            selected_task_index: 0,
+            edit_mode: EditMode::None,
+            edit_buffer: TaskEditBuffer::default(),
+        }
+    }
+
+    /// Create a new TUI app in setup mode (no config found).
+    pub fn new_setup(repo_path: impl AsRef<Path>, detected: DetectedFiles) -> Self {
+        Self {
+            repo_path: repo_path.as_ref().to_path_buf(),
+            mode: TuiMode::Setup,
+            setup: SetupState {
+                step: SetupStep::Welcome,
+                detected,
+                agent_cmd: "claude --print".to_string(), // sensible default
+                git_mode: GitMode::Branch,
+                tasks: Vec::new(),
+                focused_field: 0,
+            },
+            run: None,
+            tasks: TaskList::default(),
+            events: Vec::new(),
+            event_file_pos: 0,
+            start_time: Instant::now(),
+            should_quit: false,
+            last_error: None,
+            log_source: LogSource::Agent,
+            log_lines: Vec::new(),
+            log_file_pos: 0,
+            log_scroll_offset: 0,
+            last_interaction: Instant::now(),
+            user_paused: false,
+            selected_task_index: 0,
+            edit_mode: EditMode::None,
+            edit_buffer: TaskEditBuffer::default(),
         }
     }
 
@@ -373,20 +507,168 @@ impl App {
             && self.run_state() == Some(RunState::Running)
             && self.is_idle_for(Duration::from_millis(500))
     }
+
+    /// Clamp selected task index to valid range.
+    pub fn clamp_task_selection(&mut self) {
+        if self.tasks.tasks.is_empty() {
+            self.selected_task_index = 0;
+        } else {
+            self.selected_task_index = self.selected_task_index.min(self.tasks.tasks.len() - 1);
+        }
+    }
+
+    /// Move task selection up.
+    pub fn select_prev_task(&mut self) {
+        if self.selected_task_index > 0 {
+            self.selected_task_index -= 1;
+        }
+    }
+
+    /// Move task selection down.
+    pub fn select_next_task(&mut self) {
+        if self.selected_task_index + 1 < self.tasks.tasks.len() {
+            self.selected_task_index += 1;
+        }
+    }
+
+    /// Start editing a new task.
+    pub fn start_new_task(&mut self) {
+        let new_id = format!("task-{}", self.tasks.tasks.len() + 1);
+        self.edit_buffer = TaskEditBuffer {
+            id: new_id,
+            title: String::new(),
+            acceptance: String::new(),
+            notes: String::new(),
+            focused_field: 0,
+        };
+        self.edit_mode = EditMode::NewTask;
+    }
+
+    /// Start editing the selected task.
+    pub fn start_edit_task(&mut self) {
+        if let Some(task) = self.tasks.tasks.get(self.selected_task_index) {
+            self.edit_buffer = TaskEditBuffer {
+                id: task.id.clone(),
+                title: task.title.clone(),
+                acceptance: task.acceptance.join("\n"),
+                notes: task.notes.clone().unwrap_or_default(),
+                focused_field: 0,
+            };
+            self.edit_mode = EditMode::EditingTask(task.id.clone());
+        }
+    }
+
+    /// Confirm and apply task edit.
+    pub fn confirm_task_edit(&mut self) -> Result<()> {
+        let acceptance: Vec<String> = self
+            .edit_buffer
+            .acceptance
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let notes = if self.edit_buffer.notes.trim().is_empty() {
+            None
+        } else {
+            Some(self.edit_buffer.notes.trim().to_string())
+        };
+
+        match &self.edit_mode {
+            EditMode::NewTask => {
+                let task = Task {
+                    id: self.edit_buffer.id.clone(),
+                    title: self.edit_buffer.title.trim().to_string(),
+                    status: TaskStatus::Todo,
+                    acceptance,
+                    validators: Vec::new(),
+                    notes,
+                };
+                self.tasks.tasks.push(task);
+                self.tasks.save()?;
+                self.selected_task_index = self.tasks.tasks.len() - 1;
+            }
+            EditMode::EditingTask(id) => {
+                if let Some(task) = self.tasks.get_mut(id) {
+                    task.title = self.edit_buffer.title.trim().to_string();
+                    task.acceptance = acceptance;
+                    task.notes = notes;
+                }
+                self.tasks.save()?;
+            }
+            _ => {}
+        }
+
+        self.edit_mode = EditMode::None;
+        Ok(())
+    }
+
+    /// Cancel current edit.
+    pub fn cancel_edit(&mut self) {
+        self.edit_mode = EditMode::None;
+        self.edit_buffer = TaskEditBuffer::default();
+    }
+
+    /// Request task deletion (shows confirmation).
+    pub fn request_delete_task(&mut self) {
+        if let Some(task) = self.tasks.tasks.get(self.selected_task_index) {
+            self.edit_mode = EditMode::ConfirmDelete(task.id.clone());
+        }
+    }
+
+    /// Confirm and delete the task.
+    pub fn confirm_delete_task(&mut self) -> Result<()> {
+        if let EditMode::ConfirmDelete(id) = &self.edit_mode {
+            let id = id.clone();
+            self.tasks.tasks.retain(|t| t.id != id);
+            self.tasks.save()?;
+            self.clamp_task_selection();
+        }
+        self.edit_mode = EditMode::None;
+        Ok(())
+    }
+}
+
+/// Detect product files in the given directory.
+pub fn detect_files(dir: &Path) -> DetectedFiles {
+    // Check for mission file
+    let mission = ["mission.md", "product/mission.md", "docs/mission.md"]
+        .iter()
+        .map(|p| dir.join(p))
+        .find(|p| p.exists());
+
+    // Check for PRD file
+    let prd = ["prd.md", "product/prd.md", "docs/prd.md", "PRD.md"]
+        .iter()
+        .map(|p| dir.join(p))
+        .find(|p| p.exists());
+
+    // Check for tech file
+    let tech = ["tech.md", "product/tech.md", "docs/tech.md", "TECH.md"]
+        .iter()
+        .map(|p| dir.join(p))
+        .find(|p| p.exists());
+
+    // Check for existing task file
+    let task_path = dir.join("ralpher.prd.json");
+    let task_file = if task_path.exists() {
+        Some(task_path)
+    } else {
+        None
+    };
+
+    DetectedFiles {
+        mission,
+        prd,
+        tech,
+        task_file,
+        is_git_repo: dir.join(".git").exists(),
+    }
 }
 
 /// Run the TUI as the main orchestrator.
 /// This is the primary entry point - the TUI owns the control loop.
 pub fn run(repo_path: &Path) -> Result<()> {
-    // Check for config
-    if !Config::exists(repo_path) {
-        anyhow::bail!("No ralpher.toml found. Create one to configure ralpher.");
-    }
-
-    // Load initial state
-    let run = Run::load(repo_path)?;
-    let tasks = TaskList::load(repo_path)?;
-
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -394,18 +676,33 @@ pub fn run(repo_path: &Path) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(repo_path, run, tasks);
-    app.refresh();
-
-    // Load or create engine
-    let mut engine: Option<RunEngine> = engine::load_engine(repo_path)?;
+    // Check for config and create appropriate app mode
+    let (mut app, mut engine) = if Config::exists(repo_path) {
+        // Normal mode: config exists
+        let run = Run::load(repo_path)?;
+        let tasks = TaskList::load(repo_path).unwrap_or_default();
+        let mut app = App::new(repo_path, run, tasks);
+        app.refresh();
+        let engine = engine::load_engine(repo_path)?;
+        (app, engine)
+    } else {
+        // Setup mode: no config found
+        let detected = detect_files(repo_path);
+        let app = App::new_setup(repo_path, detected);
+        (app, None)
+    };
 
     let tick_rate = Duration::from_millis(250);
     let mut last_tick = Instant::now();
 
     loop {
-        // Draw UI
-        terminal.draw(|f| draw_ui(f, &app))?;
+        // Draw UI based on mode
+        terminal.draw(|f| {
+            match app.mode {
+                TuiMode::Setup => draw_setup_ui(f, &app),
+                TuiMode::Normal => draw_ui(f, &app),
+            }
+        })?;
 
         // Handle input
         let timeout = tick_rate
@@ -418,117 +715,26 @@ pub fn run(repo_path: &Path) -> Result<()> {
             // Mark user interaction to reset idle timer
             app.touch();
 
-            match key.code {
-                KeyCode::Char('q') => {
-                    // Quit: if running, pause first
-                    if let Some(ref mut eng) = engine
-                        && eng.run().state == RunState::Running
-                        && let Err(e) = eng.pause()
-                    {
-                        warn!(error = %e, "failed to pause on quit");
-                    }
-                    app.should_quit = true;
-                }
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some(ref mut eng) = engine
-                        && eng.run().state == RunState::Running
-                        && let Err(e) = eng.pause()
-                    {
-                        warn!(error = %e, "failed to pause on Ctrl+C");
-                    }
-                    app.should_quit = true;
-                }
-                KeyCode::Char(' ') => {
-                    // Space: toggle pause/resume
-                    match app.run_state() {
-                        Some(RunState::Running) => {
-                            if let Some(ref mut eng) = engine {
-                                if let Err(e) = eng.pause() {
-                                    app.last_error = Some(format!("Pause failed: {}", e));
-                                } else {
-                                    app.user_paused = true;
-                                    info!("run paused");
-                                }
-                            }
-                        }
-                        Some(RunState::Paused) => {
-                            if let Some(ref mut eng) = engine {
-                                if let Err(e) = eng.resume() {
-                                    app.last_error = Some(format!("Resume failed: {}", e));
-                                } else {
-                                    app.user_paused = false;
-                                    info!("run resumed");
-                                }
-                            }
-                        }
-                        Some(RunState::Idle) | None => {
-                            // No run or idle - start a new one
-                            match engine::create_engine(repo_path) {
-                                Ok(mut eng) => {
-                                    if let Err(e) = eng.start() {
-                                        app.last_error = Some(format!("Start failed: {}", e));
-                                    } else {
-                                        info!(run_id = %eng.run().run_id, "run started");
-                                        app.user_paused = false;
-                                        engine = Some(eng);
-                                    }
-                                }
-                                Err(e) => {
-                                    app.last_error =
-                                        Some(format!("Failed to create engine: {}", e));
-                                }
-                            }
-                        }
-                        _ => {} // No action for terminal states
+            // Dispatch based on mode
+            match app.mode {
+                TuiMode::Setup => {
+                    handle_setup_input(&mut app, key, repo_path)?;
+                    // Check if setup completed - transition to normal mode
+                    if app.mode == TuiMode::Normal {
+                        // Reload config and tasks after setup
+                        app.tasks = TaskList::load(repo_path).unwrap_or_default();
+                        app.refresh();
+                        engine = engine::load_engine(repo_path)?;
                     }
                 }
-                KeyCode::Char('a') => {
-                    // Abort: only if not in terminal state
-                    match app.run_state() {
-                        Some(RunState::Running) | Some(RunState::Paused) => {
-                            if let Some(ref mut eng) = engine {
-                                if let Err(e) = eng.abort("User requested abort via TUI") {
-                                    app.last_error = Some(format!("Abort failed: {}", e));
-                                } else {
-                                    info!("run aborted");
-                                }
-                            }
-                        }
-                        _ => {}
+                TuiMode::Normal => {
+                    // Check if we're in an edit mode first
+                    if app.edit_mode != EditMode::None {
+                        handle_edit_input(&mut app, key)?;
+                    } else {
+                        handle_normal_input(&mut app, &mut engine, key, repo_path)?;
                     }
                 }
-                KeyCode::Char('s') => {
-                    // Skip: only if running or paused
-                    match app.run_state() {
-                        Some(RunState::Running) | Some(RunState::Paused) => {
-                            if let Some(ref mut eng) = engine {
-                                match eng.skip_task("User skipped via TUI") {
-                                    Ok(Some(task_id)) => {
-                                        info!(task_id = %task_id, "task skipped");
-                                    }
-                                    Ok(None) => {
-                                        debug!("no task to skip");
-                                    }
-                                    Err(e) => {
-                                        app.last_error = Some(format!("Skip failed: {}", e));
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                KeyCode::Char('r') => app.refresh(),
-                KeyCode::Char('l') => app.toggle_log_source(),
-                KeyCode::Up | KeyCode::Char('k') => app.scroll_log_up(1),
-                KeyCode::Down | KeyCode::Char('j') => app.scroll_log_down(1),
-                KeyCode::PageUp => app.scroll_log_up(10),
-                KeyCode::PageDown => app.scroll_log_down(10),
-                KeyCode::Home => {
-                    app.log_scroll_offset = app.log_lines.len().saturating_sub(1);
-                }
-                KeyCode::End => app.scroll_log_to_bottom(),
-                _ => {}
             }
         }
 
@@ -607,6 +813,576 @@ pub fn run(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Handle input in setup mode.
+fn handle_setup_input(app: &mut App, key: crossterm::event::KeyEvent, repo_path: &Path) -> Result<()> {
+    use crossterm::event::KeyCode;
+
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => {
+            app.should_quit = true;
+        }
+        KeyCode::Enter => {
+            // Advance to next step or complete setup
+            match app.setup.step {
+                SetupStep::Welcome => {
+                    app.setup.step = SetupStep::AgentConfig;
+                }
+                SetupStep::AgentConfig => {
+                    if !app.setup.agent_cmd.trim().is_empty() {
+                        app.setup.step = SetupStep::GitMode;
+                    }
+                }
+                SetupStep::GitMode => {
+                    app.setup.step = SetupStep::Tasks;
+                }
+                SetupStep::Tasks => {
+                    app.setup.step = SetupStep::Review;
+                }
+                SetupStep::Review => {
+                    // Complete setup: save config and tasks
+                    let config = Config::from_setup(&app.setup.agent_cmd, app.setup.git_mode);
+                    config.save(repo_path)?;
+
+                    // Save tasks if any were created
+                    if !app.setup.tasks.is_empty() {
+                        let task_list = TaskList::new(app.setup.tasks.clone());
+                        task_list.save_to(&repo_path.join("ralpher.prd.json"))?;
+                    } else {
+                        // Create empty task file
+                        let task_list = TaskList::new(vec![]);
+                        task_list.save_to(&repo_path.join("ralpher.prd.json"))?;
+                    }
+
+                    // Transition to normal mode
+                    app.mode = TuiMode::Normal;
+                    info!("setup completed, transitioning to normal mode");
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            // In AgentConfig step, backspace removes characters from command
+            // In other steps, it goes back to previous step
+            if app.setup.step == SetupStep::AgentConfig && !app.setup.agent_cmd.is_empty() {
+                app.setup.agent_cmd.pop();
+            } else {
+                // Go back to previous step
+                match app.setup.step {
+                    SetupStep::Welcome => {}
+                    SetupStep::AgentConfig => app.setup.step = SetupStep::Welcome,
+                    SetupStep::GitMode => app.setup.step = SetupStep::AgentConfig,
+                    SetupStep::Tasks => app.setup.step = SetupStep::GitMode,
+                    SetupStep::Review => app.setup.step = SetupStep::Tasks,
+                }
+            }
+        }
+        KeyCode::Tab => {
+            // Toggle git mode in GitMode step
+            if app.setup.step == SetupStep::GitMode {
+                app.setup.git_mode = match app.setup.git_mode {
+                    GitMode::Branch => GitMode::Trunk,
+                    GitMode::Trunk => GitMode::Branch,
+                };
+            }
+        }
+        KeyCode::Char('n') if app.setup.step == SetupStep::Tasks => {
+            // Add a new task in tasks step
+            let task_id = format!("task-{}", app.setup.tasks.len() + 1);
+            app.setup.tasks.push(Task {
+                id: task_id,
+                title: format!("Task {}", app.setup.tasks.len() + 1),
+                status: TaskStatus::Todo,
+                acceptance: vec![],
+                validators: vec![],
+                notes: None,
+            });
+        }
+        KeyCode::Char(c) => {
+            // Text input for agent command
+            if app.setup.step == SetupStep::AgentConfig {
+                app.setup.agent_cmd.push(c);
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+/// Handle input in normal mode (not editing).
+fn handle_normal_input(
+    app: &mut App,
+    engine: &mut Option<RunEngine>,
+    key: crossterm::event::KeyEvent,
+    repo_path: &Path,
+) -> Result<()> {
+    use crossterm::event::KeyCode;
+
+    match key.code {
+        KeyCode::Char('q') => {
+            // Quit: if running, pause first
+            if let Some(eng) = engine
+                && eng.run().state == RunState::Running
+                && let Err(e) = eng.pause()
+            {
+                warn!(error = %e, "failed to pause on quit");
+            }
+            app.should_quit = true;
+        }
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(eng) = engine
+                && eng.run().state == RunState::Running
+                && let Err(e) = eng.pause()
+            {
+                warn!(error = %e, "failed to pause on Ctrl+C");
+            }
+            app.should_quit = true;
+        }
+        KeyCode::Char(' ') => {
+            // Space: toggle pause/resume
+            match app.run_state() {
+                Some(RunState::Running) => {
+                    if let Some(eng) = engine {
+                        if let Err(e) = eng.pause() {
+                            app.last_error = Some(format!("Pause failed: {}", e));
+                        } else {
+                            app.user_paused = true;
+                            info!("run paused");
+                        }
+                    }
+                }
+                Some(RunState::Paused) => {
+                    if let Some(eng) = engine {
+                        if let Err(e) = eng.resume() {
+                            app.last_error = Some(format!("Resume failed: {}", e));
+                        } else {
+                            app.user_paused = false;
+                            info!("run resumed");
+                        }
+                    }
+                }
+                Some(RunState::Idle) | None => {
+                    // No run or idle - start a new one
+                    match engine::create_engine(repo_path) {
+                        Ok(mut eng) => {
+                            if let Err(e) = eng.start() {
+                                app.last_error = Some(format!("Start failed: {}", e));
+                            } else {
+                                info!(run_id = %eng.run().run_id, "run started");
+                                app.user_paused = false;
+                                *engine = Some(eng);
+                            }
+                        }
+                        Err(e) => {
+                            app.last_error = Some(format!("Failed to create engine: {}", e));
+                        }
+                    }
+                }
+                _ => {} // No action for terminal states
+            }
+        }
+        KeyCode::Char('a') => {
+            // Abort: only if not in terminal state
+            match app.run_state() {
+                Some(RunState::Running) | Some(RunState::Paused) => {
+                    if let Some(eng) = engine {
+                        if let Err(e) = eng.abort("User requested abort via TUI") {
+                            app.last_error = Some(format!("Abort failed: {}", e));
+                        } else {
+                            info!("run aborted");
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        KeyCode::Char('s') => {
+            // Skip: only if running or paused
+            match app.run_state() {
+                Some(RunState::Running) | Some(RunState::Paused) => {
+                    if let Some(eng) = engine {
+                        match eng.skip_task("User skipped via TUI") {
+                            Ok(Some(task_id)) => {
+                                info!(task_id = %task_id, "task skipped");
+                            }
+                            Ok(None) => {
+                                debug!("no task to skip");
+                            }
+                            Err(e) => {
+                                app.last_error = Some(format!("Skip failed: {}", e));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        KeyCode::Char('r') => app.refresh(),
+        KeyCode::Char('l') => app.toggle_log_source(),
+
+        // Task navigation
+        KeyCode::Tab | KeyCode::BackTab => {
+            // Tab cycles through task list
+            if key.code == KeyCode::Tab {
+                app.select_next_task();
+            } else {
+                app.select_prev_task();
+            }
+        }
+
+        // Task CRUD
+        KeyCode::Char('n') => {
+            // New task
+            app.start_new_task();
+        }
+        KeyCode::Char('e') => {
+            // Edit selected task
+            app.start_edit_task();
+        }
+        KeyCode::Char('d') => {
+            // Delete selected task (with confirmation)
+            app.request_delete_task();
+        }
+
+        // Log scrolling
+        KeyCode::Up | KeyCode::Char('k') => app.scroll_log_up(1),
+        KeyCode::Down | KeyCode::Char('j') => app.scroll_log_down(1),
+        KeyCode::PageUp => app.scroll_log_up(10),
+        KeyCode::PageDown => app.scroll_log_down(10),
+        KeyCode::Home => {
+            app.log_scroll_offset = app.log_lines.len().saturating_sub(1);
+        }
+        KeyCode::End => app.scroll_log_to_bottom(),
+        _ => {}
+    }
+
+    Ok(())
+}
+
+/// Handle input in edit mode (editing a task).
+fn handle_edit_input(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()> {
+    use crossterm::event::KeyCode;
+
+    // Handle confirmation dialogs first
+    if let EditMode::ConfirmDelete(_) = &app.edit_mode {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                app.confirm_delete_task()?;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                app.cancel_edit();
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // Task editing
+    match key.code {
+        KeyCode::Esc => {
+            app.cancel_edit();
+        }
+        KeyCode::Tab => {
+            // Cycle through fields: title -> acceptance -> notes -> title
+            app.edit_buffer.focused_field = (app.edit_buffer.focused_field + 1) % 3;
+        }
+        KeyCode::BackTab => {
+            // Cycle backwards
+            app.edit_buffer.focused_field = if app.edit_buffer.focused_field == 0 {
+                2
+            } else {
+                app.edit_buffer.focused_field - 1
+            };
+        }
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Ctrl+Enter: confirm edit
+            if !app.edit_buffer.title.trim().is_empty() {
+                app.confirm_task_edit()?;
+            }
+        }
+        KeyCode::Enter => {
+            // Regular Enter: newline in acceptance/notes, or confirm if in title
+            match app.edit_buffer.focused_field {
+                0 => {
+                    // Title field - confirm if not empty
+                    if !app.edit_buffer.title.trim().is_empty() {
+                        app.confirm_task_edit()?;
+                    }
+                }
+                1 => {
+                    // Acceptance field - add newline
+                    app.edit_buffer.acceptance.push('\n');
+                }
+                2 => {
+                    // Notes field - add newline
+                    app.edit_buffer.notes.push('\n');
+                }
+                _ => {}
+            }
+        }
+        KeyCode::Char(c) => {
+            // Add character to focused field
+            match app.edit_buffer.focused_field {
+                0 => app.edit_buffer.title.push(c),
+                1 => app.edit_buffer.acceptance.push(c),
+                2 => app.edit_buffer.notes.push(c),
+                _ => {}
+            }
+        }
+        KeyCode::Backspace => {
+            // Remove character from focused field
+            match app.edit_buffer.focused_field {
+                0 => {
+                    app.edit_buffer.title.pop();
+                }
+                1 => {
+                    app.edit_buffer.acceptance.pop();
+                }
+                2 => {
+                    app.edit_buffer.notes.pop();
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+/// Draw the setup wizard UI.
+fn draw_setup_ui(f: &mut ratatui::Frame, app: &App) {
+    let size = f.area();
+
+    // Create layout
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Header
+            Constraint::Min(10),    // Main content
+            Constraint::Length(3),  // Detected files
+            Constraint::Length(1),  // Footer
+        ])
+        .split(size);
+
+    // Header
+    let step_name = match app.setup.step {
+        SetupStep::Welcome => "Welcome",
+        SetupStep::AgentConfig => "Agent Configuration",
+        SetupStep::GitMode => "Git Mode",
+        SetupStep::Tasks => "Tasks",
+        SetupStep::Review => "Review & Save",
+    };
+    let step_num = match app.setup.step {
+        SetupStep::Welcome => 1,
+        SetupStep::AgentConfig => 2,
+        SetupStep::GitMode => 3,
+        SetupStep::Tasks => 4,
+        SetupStep::Review => 5,
+    };
+
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(" ralpher setup ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw(" - "),
+        Span::styled(format!("Step {}/5: {}", step_num, step_name), Style::default().fg(Color::Yellow)),
+    ]))
+    .block(Block::default().borders(Borders::ALL));
+
+    f.render_widget(header, chunks[0]);
+
+    // Main content based on step
+    draw_setup_step(f, app, chunks[1]);
+
+    // Detected files panel
+    draw_detected_files(f, app, chunks[2]);
+
+    // Footer with controls
+    let footer_text = match app.setup.step {
+        SetupStep::Welcome => " Enter: Continue  |  q: Quit ",
+        SetupStep::AgentConfig => " Enter: Continue  |  Backspace: Back  |  q: Quit ",
+        SetupStep::GitMode => " Tab: Toggle  |  Enter: Continue  |  Backspace: Back  |  q: Quit ",
+        SetupStep::Tasks => " n: New Task  |  Enter: Continue  |  Backspace: Back  |  q: Quit ",
+        SetupStep::Review => " Enter: Save & Start  |  Backspace: Back  |  q: Quit ",
+    };
+    let footer = Paragraph::new(footer_text).style(Style::default().fg(Color::DarkGray));
+    f.render_widget(footer, chunks[3]);
+}
+
+/// Draw the current setup step content.
+fn draw_setup_step(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    match app.setup.step {
+        SetupStep::Welcome => {
+            let text = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Welcome to ralpher!",
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from("No ralpher.toml configuration found in this directory."),
+                Line::from("This wizard will help you set up ralpher for your project."),
+                Line::from(""),
+                Line::from("ralpher will:"),
+                Line::from("  - Run an AI agent in iterative loops"),
+                Line::from("  - Track task completion"),
+                Line::from("  - Checkpoint progress via git"),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Press Enter to continue...",
+                    Style::default().fg(Color::Yellow),
+                )),
+            ];
+            let para = Paragraph::new(text)
+                .block(Block::default().borders(Borders::ALL).title(" Welcome "))
+                .wrap(Wrap { trim: true });
+            f.render_widget(para, area);
+        }
+        SetupStep::AgentConfig => {
+            let text = vec![
+                Line::from(""),
+                Line::from("Enter the command to run your AI agent:"),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("> {}_", app.setup.agent_cmd),
+                    Style::default().fg(Color::Cyan),
+                )),
+                Line::from(""),
+                Line::from(Span::styled("Examples:", Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled("  claude --print", Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled("  aider --message", Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled("  codex run", Style::default().fg(Color::DarkGray))),
+            ];
+            let para = Paragraph::new(text)
+                .block(Block::default().borders(Borders::ALL).title(" Agent Command "))
+                .wrap(Wrap { trim: true });
+            f.render_widget(para, area);
+        }
+        SetupStep::GitMode => {
+            let branch_style = if app.setup.git_mode == GitMode::Branch {
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let trunk_style = if app.setup.git_mode == GitMode::Trunk {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+
+            let text = vec![
+                Line::from(""),
+                Line::from("Select git mode for checkpointing:"),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(" Branch ", branch_style),
+                    Span::raw("  Create a dedicated branch for the run (safe default)"),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(" Trunk  ", trunk_style),
+                    Span::raw("  Operate directly on current branch (commits directly)"),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Press Tab to toggle selection",
+                    Style::default().fg(Color::Yellow),
+                )),
+            ];
+            let para = Paragraph::new(text)
+                .block(Block::default().borders(Borders::ALL).title(" Git Mode "))
+                .wrap(Wrap { trim: true });
+            f.render_widget(para, area);
+        }
+        SetupStep::Tasks => {
+            let mut lines = vec![
+                Line::from(""),
+                Line::from("Tasks to complete (optional):"),
+                Line::from(""),
+            ];
+
+            if app.setup.tasks.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "  No tasks yet. Press 'n' to add a task, or continue without tasks.",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                for (i, task) in app.setup.tasks.iter().enumerate() {
+                    lines.push(Line::from(format!("  {}. {}", i + 1, task.title)));
+                }
+            }
+
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "You can add more tasks later from the TUI.",
+                Style::default().fg(Color::DarkGray),
+            )));
+
+            let para = Paragraph::new(lines)
+                .block(Block::default().borders(Borders::ALL).title(" Tasks "))
+                .wrap(Wrap { trim: true });
+            f.render_widget(para, area);
+        }
+        SetupStep::Review => {
+            let git_mode_str = match app.setup.git_mode {
+                GitMode::Branch => "branch (safe)",
+                GitMode::Trunk => "trunk (direct commits)",
+            };
+
+            let text = vec![
+                Line::from(""),
+                Line::from(Span::styled("Configuration Summary:", Style::default().add_modifier(Modifier::BOLD))),
+                Line::from(""),
+                Line::from(format!("  Agent command: {}", app.setup.agent_cmd)),
+                Line::from(format!("  Git mode: {}", git_mode_str)),
+                Line::from(format!("  Tasks: {}", app.setup.tasks.len())),
+                Line::from(""),
+                Line::from("Files to be created:"),
+                Line::from(Span::styled("  - ralpher.toml", Style::default().fg(Color::Green))),
+                Line::from(Span::styled("  - ralpher.prd.json", Style::default().fg(Color::Green))),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Press Enter to save and start ralpher...",
+                    Style::default().fg(Color::Yellow),
+                )),
+            ];
+            let para = Paragraph::new(text)
+                .block(Block::default().borders(Borders::ALL).title(" Review "))
+                .wrap(Wrap { trim: true });
+            f.render_widget(para, area);
+        }
+    }
+}
+
+/// Draw detected files panel.
+fn draw_detected_files(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let mut spans = vec![Span::raw(" Detected: ")];
+
+    if app.setup.detected.is_git_repo {
+        spans.push(Span::styled("git ", Style::default().fg(Color::Green)));
+    }
+    if app.setup.detected.mission.is_some() {
+        spans.push(Span::styled("mission.md ", Style::default().fg(Color::Cyan)));
+    }
+    if app.setup.detected.prd.is_some() {
+        spans.push(Span::styled("prd.md ", Style::default().fg(Color::Cyan)));
+    }
+    if app.setup.detected.tech.is_some() {
+        spans.push(Span::styled("tech.md ", Style::default().fg(Color::Cyan)));
+    }
+    if app.setup.detected.task_file.is_some() {
+        spans.push(Span::styled("ralpher.prd.json ", Style::default().fg(Color::Yellow)));
+    }
+
+    if spans.len() == 1 {
+        spans.push(Span::styled("(no product files found)", Style::default().fg(Color::DarkGray)));
+    }
+
+    let para = Paragraph::new(Line::from(spans))
+        .block(Block::default().borders(Borders::ALL));
+    f.render_widget(para, area);
+}
+
 /// Draw the TUI.
 fn draw_ui(f: &mut ratatui::Frame, app: &App) {
     let size = f.area();
@@ -628,6 +1404,151 @@ fn draw_ui(f: &mut ratatui::Frame, app: &App) {
     draw_main_content(f, app, chunks[2]);
     draw_log_panel(f, app, chunks[3]);
     draw_footer(f, app, chunks[4]);
+
+    // Draw overlays on top
+    match &app.edit_mode {
+        EditMode::None => {}
+        EditMode::NewTask | EditMode::EditingTask(_) => {
+            draw_task_editor_overlay(f, app, size);
+        }
+        EditMode::ConfirmDelete(task_id) => {
+            draw_delete_confirm_overlay(f, task_id, size);
+        }
+    }
+}
+
+/// Draw task editor overlay.
+fn draw_task_editor_overlay(f: &mut ratatui::Frame, app: &App, size: Rect) {
+    use ratatui::widgets::Clear;
+
+    // Center the popup
+    let popup_width = size.width.min(60);
+    let popup_height = size.height.min(18);
+    let popup_x = (size.width.saturating_sub(popup_width)) / 2;
+    let popup_y = (size.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+    // Clear the area
+    f.render_widget(Clear, popup_area);
+
+    // Title
+    let title = match &app.edit_mode {
+        EditMode::NewTask => " New Task ",
+        EditMode::EditingTask(_) => " Edit Task ",
+        _ => " Task ",
+    };
+
+    // Build content
+    let focused = app.edit_buffer.focused_field;
+
+    let title_style = if focused == 0 {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let acceptance_style = if focused == 1 {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let notes_style = if focused == 2 {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+
+    let cursor = "_";
+    let title_text = if focused == 0 {
+        format!("{}{}", app.edit_buffer.title, cursor)
+    } else {
+        app.edit_buffer.title.clone()
+    };
+    let acceptance_text = if focused == 1 {
+        format!("{}{}", app.edit_buffer.acceptance, cursor)
+    } else {
+        app.edit_buffer.acceptance.clone()
+    };
+    let notes_text = if focused == 2 {
+        format!("{}{}", app.edit_buffer.notes, cursor)
+    } else {
+        app.edit_buffer.notes.clone()
+    };
+
+    let mut lines = vec![
+        Line::from(Span::styled("Title:", title_style)),
+        Line::from(Span::styled(format!("  {}", title_text), title_style)),
+        Line::from(""),
+        Line::from(Span::styled("Acceptance Criteria (one per line):", acceptance_style)),
+    ];
+
+    for line in acceptance_text.lines() {
+        lines.push(Line::from(Span::styled(format!("  {}", line), acceptance_style)));
+    }
+    if acceptance_text.is_empty() || acceptance_text.ends_with('\n') {
+        lines.push(Line::from(Span::styled("  ", acceptance_style)));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("Notes:", notes_style)));
+    for line in notes_text.lines() {
+        lines.push(Line::from(Span::styled(format!("  {}", line), notes_style)));
+    }
+    if notes_text.is_empty() || notes_text.ends_with('\n') {
+        lines.push(Line::from(Span::styled("  ", notes_style)));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Tab: Next field  |  Enter: Save  |  Esc: Cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let para = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(title),
+        )
+        .wrap(Wrap { trim: false });
+
+    f.render_widget(para, popup_area);
+}
+
+/// Draw delete confirmation overlay.
+fn draw_delete_confirm_overlay(f: &mut ratatui::Frame, task_id: &str, size: Rect) {
+    use ratatui::widgets::Clear;
+
+    // Center the popup
+    let popup_width = size.width.min(50);
+    let popup_height = 7;
+    let popup_x = (size.width.saturating_sub(popup_width)) / 2;
+    let popup_y = (size.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+    // Clear the area
+    f.render_widget(Clear, popup_area);
+
+    let text = vec![
+        Line::from(""),
+        Line::from(format!("Delete task '{}'?", task_id)),
+        Line::from(""),
+        Line::from(Span::styled(
+            "y: Yes, delete  |  n: No, cancel",
+            Style::default().fg(Color::Yellow),
+        )),
+    ];
+
+    let para = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red))
+                .title(" Confirm Delete "),
+        )
+        .alignment(ratatui::layout::Alignment::Center);
+
+    f.render_widget(para, popup_area);
 }
 
 /// Draw the header with run state, iteration, elapsed time.
@@ -721,8 +1642,9 @@ fn draw_task_list(f: &mut ratatui::Frame, app: &App, area: Rect) {
         .tasks
         .tasks
         .iter()
-        .map(|task| {
-            let (status_icon, style) = match task.status {
+        .enumerate()
+        .map(|(idx, task)| {
+            let (status_icon, mut style) = match task.status {
                 TaskStatus::Done => ("[x]", Style::default().fg(Color::Green)),
                 TaskStatus::InProgress => (
                     "[>]",
@@ -734,36 +1656,45 @@ fn draw_task_list(f: &mut ratatui::Frame, app: &App, area: Rect) {
                 TaskStatus::Todo => ("[ ]", Style::default().fg(Color::Gray)),
             };
 
-            let is_current = app
+            let is_running_task = app
                 .run
                 .as_ref()
                 .and_then(|r| r.current_task_id.as_ref())
                 .map(|id| id == &task.id)
                 .unwrap_or(false);
 
-            let line_style = if is_current {
-                style.add_modifier(Modifier::REVERSED)
-            } else {
-                style
-            };
+            // Selection highlighting takes priority
+            let is_selected = idx == app.selected_task_index;
+
+            if is_selected {
+                style = style.add_modifier(Modifier::REVERSED);
+            } else if is_running_task {
+                style = style.add_modifier(Modifier::UNDERLINED);
+            }
+
+            // Add selection marker
+            let marker = if is_selected { ">" } else { " " };
 
             ListItem::new(Line::from(vec![
+                Span::styled(marker, Style::default().fg(Color::Cyan)),
                 Span::styled(format!("{} ", status_icon), style),
-                Span::styled(&task.title, line_style),
+                Span::styled(&task.title, style),
             ]))
         })
         .collect();
 
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(" Tasks "));
+    let title = format!(" Tasks ({}) ", app.tasks.tasks.len());
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
 
     f.render_widget(list, area);
 }
 
 /// Draw the current task details.
 fn draw_task_details(f: &mut ratatui::Frame, app: &App, area: Rect) {
-    let current_task = app.tasks.current_task();
+    // Show selected task instead of running task for better UX
+    let selected_task = app.tasks.tasks.get(app.selected_task_index);
 
-    let content = if let Some(task) = current_task {
+    let content = if let Some(task) = selected_task {
         let mut lines = vec![
             Line::from(vec![
                 Span::styled("ID: ", Style::default().add_modifier(Modifier::BOLD)),
@@ -938,17 +1869,34 @@ fn draw_footer(f: &mut ratatui::Frame, app: &App, area: Rect) {
         _ => {}
     }
 
+    // Task CRUD controls
+    spans.push(Span::styled(
+        " n ",
+        Style::default().add_modifier(Modifier::REVERSED),
+    ));
+    spans.push(Span::raw(" New  "));
+    spans.push(Span::styled(
+        " e ",
+        Style::default().add_modifier(Modifier::REVERSED),
+    ));
+    spans.push(Span::raw(" Edit  "));
+    spans.push(Span::styled(
+        " d ",
+        Style::default().add_modifier(Modifier::REVERSED),
+    ));
+    spans.push(Span::raw(" Del  "));
+
     // Navigation controls
+    spans.push(Span::styled(
+        " Tab ",
+        Style::default().add_modifier(Modifier::REVERSED),
+    ));
+    spans.push(Span::raw(" Nav  "));
     spans.push(Span::styled(
         " l ",
         Style::default().add_modifier(Modifier::REVERSED),
     ));
-    spans.push(Span::raw(format!(" {} Log  ", log_toggle_hint)));
-    spans.push(Span::styled(
-        " j/k ",
-        Style::default().add_modifier(Modifier::REVERSED),
-    ));
-    spans.push(Span::raw(" Scroll  "));
+    spans.push(Span::raw(format!(" {} ", log_toggle_hint)));
 
     let footer = Paragraph::new(Line::from(spans));
 

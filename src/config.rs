@@ -94,6 +94,118 @@ impl Config {
     pub fn exists(dir: &Path) -> bool {
         dir.join(CONFIG_FILE_NAME).exists()
     }
+
+    /// Save configuration to the given directory.
+    pub fn save(&self, dir: &Path) -> Result<()> {
+        let config_path = dir.join(CONFIG_FILE_NAME);
+
+        // Build TOML content manually for better formatting
+        let mut content = String::new();
+
+        // Git mode
+        let git_mode_str = match self.git_mode {
+            GitMode::Branch => "branch",
+            GitMode::Trunk => "trunk",
+        };
+        content.push_str(&format!("git_mode = \"{}\"\n", git_mode_str));
+
+        // Max iterations (only if not default)
+        if self.max_iterations != DEFAULT_MAX_ITERATIONS {
+            content.push_str(&format!("max_iterations = {}\n", self.max_iterations));
+        }
+
+        // Validators
+        if !self.validators.is_empty() {
+            content.push_str("validators = [\n");
+            for v in &self.validators {
+                content.push_str(&format!("    \"{}\",\n", v.replace('\"', "\\\"")));
+            }
+            content.push_str("]\n");
+        }
+
+        // Agent config
+        if let Some(agent) = &self.agent {
+            content.push_str("\n[agent]\n");
+            content.push_str(&format!("type = \"{}\"\n", agent.runner_type));
+            content.push_str("cmd = [");
+            let cmd_parts: Vec<String> = agent
+                .cmd
+                .iter()
+                .map(|s| format!("\"{}\"", s.replace('\"', "\\\"")))
+                .collect();
+            content.push_str(&cmd_parts.join(", "));
+            content.push_str("]\n");
+        }
+
+        // Policy (only non-default values)
+        let policy = &self.policy;
+        let has_policy_config = !policy.deny_deletes
+            || !policy.deny_renames
+            || !policy.allow_paths.is_empty()
+            || !policy.deny_paths.is_empty()
+            || policy.on_violation != crate::policy::ViolationAction::Abort;
+
+        if has_policy_config {
+            content.push_str("\n[policy]\n");
+            if !policy.deny_deletes {
+                content.push_str("deny_deletes = false\n");
+            }
+            if !policy.deny_renames {
+                content.push_str("deny_renames = false\n");
+            }
+            if !policy.allow_paths.is_empty() {
+                content.push_str("allow_paths = [");
+                let paths: Vec<String> = policy
+                    .allow_paths
+                    .iter()
+                    .map(|s| format!("\"{}\"", s))
+                    .collect();
+                content.push_str(&paths.join(", "));
+                content.push_str("]\n");
+            }
+            if !policy.deny_paths.is_empty() {
+                content.push_str("deny_paths = [");
+                let paths: Vec<String> = policy
+                    .deny_paths
+                    .iter()
+                    .map(|s| format!("\"{}\"", s))
+                    .collect();
+                content.push_str(&paths.join(", "));
+                content.push_str("]\n");
+            }
+            if policy.on_violation != crate::policy::ViolationAction::Abort {
+                let action = match policy.on_violation {
+                    crate::policy::ViolationAction::Abort => "abort",
+                    crate::policy::ViolationAction::Reset => "reset",
+                    crate::policy::ViolationAction::Keep => "keep",
+                };
+                content.push_str(&format!("on_violation = \"{}\"\n", action));
+            }
+        }
+
+        std::fs::write(&config_path, content)
+            .with_context(|| format!("Failed to write {}", config_path.display()))?;
+
+        Ok(())
+    }
+
+    /// Create a config from setup wizard input.
+    pub fn from_setup(agent_cmd: &str, git_mode: GitMode) -> Self {
+        // Parse the command string into parts
+        let cmd: Vec<String> = shell_words::split(agent_cmd)
+            .unwrap_or_else(|_| vec![agent_cmd.to_string()]);
+
+        Self {
+            git_mode,
+            agent: Some(AgentConfig {
+                runner_type: "command".to_string(),
+                cmd,
+            }),
+            validators: Vec::new(),
+            policy: PolicyConfig::default(),
+            max_iterations: DEFAULT_MAX_ITERATIONS,
+        }
+    }
 }
 
 #[cfg(test)]
