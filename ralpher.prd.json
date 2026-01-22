@@ -108,6 +108,11 @@
         "Actions emit appropriate events"
       ],
       "notes": "Implemented TUI controls: (1) Added TuiAction enum for Pause/Resume/Abort/Skip/Quit; (2) Space key toggles pause/resume based on run state; (3) 'a' key aborts active runs; (4) 's' key skips current task by marking it blocked; (5) 'q' key quits TUI (pauses if running); (6) Added skip_task() method to RunEngine that marks task as blocked and emits TaskStatusChanged event; (7) Integrated TUI with engine via run_with_tui() function; (8) Added --headless flag to continue/start commands; (9) Dynamic footer shows available controls based on run state. All 101 unit tests and 29 integration tests pass."
+    },
+    {
+      "id": "task-10",
+      "title": "make initial task generation based on prd instead of manual",
+      "status": "todo"
     }
   ]
 }
