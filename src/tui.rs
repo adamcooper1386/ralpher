@@ -140,6 +140,8 @@ pub struct SetupState {
 pub struct App {
     /// Path to the repository root.
     repo_path: PathBuf,
+    /// Loaded config (for checking archon settings without engine).
+    config: Option<Config>,
     /// Current TUI operating mode.
     mode: TuiMode,
     /// Setup wizard state (only used in Setup mode).
@@ -180,9 +182,15 @@ pub struct App {
 
 impl App {
     /// Create a new TUI app in normal mode.
-    pub fn new(repo_path: impl AsRef<Path>, run: Option<Run>, tasks: TaskList) -> Self {
+    pub fn new(
+        repo_path: impl AsRef<Path>,
+        run: Option<Run>,
+        tasks: TaskList,
+        config: Config,
+    ) -> Self {
         Self {
             repo_path: repo_path.as_ref().to_path_buf(),
+            config: Some(config),
             mode: TuiMode::Normal,
             setup: SetupState::default(),
             run,
@@ -215,6 +223,7 @@ impl App {
 
         Self {
             repo_path: repo_path.as_ref().to_path_buf(),
+            config: None,
             mode: TuiMode::Setup,
             setup: SetupState {
                 step: SetupStep::Welcome,
@@ -700,9 +709,10 @@ pub fn run(repo_path: &Path) -> Result<()> {
     // Check for config and create appropriate app mode
     let (mut app, mut engine) = if Config::exists(repo_path) {
         // Normal mode: config exists
+        let (config, _) = Config::load(repo_path)?;
         let run = Run::load(repo_path)?;
         let tasks = TaskList::load(repo_path).unwrap_or_default();
-        let mut app = App::new(repo_path, run, tasks);
+        let mut app = App::new(repo_path, run, tasks, config);
         app.refresh();
         let engine = engine::load_engine(repo_path)?;
         (app, engine)
@@ -741,6 +751,9 @@ pub fn run(repo_path: &Path) -> Result<()> {
                     // Check if setup completed - transition to normal mode
                     if app.mode == TuiMode::Normal {
                         // Reload config and tasks after setup
+                        if let Ok((config, _)) = Config::load(repo_path) {
+                            app.config = Some(config);
+                        }
                         app.tasks = TaskList::load(repo_path).unwrap_or_default();
                         app.refresh();
                         engine = engine::load_engine(repo_path)?;
@@ -1132,9 +1145,9 @@ fn handle_normal_input(
             app.request_delete_task();
         }
         KeyCode::Char('m') => {
-            // Migration menu (only show if archon is enabled)
-            if let Some(eng) = engine
-                && eng.config().archon.enabled
+            // Migration menu (only show if archon is enabled in config)
+            if let Some(ref config) = app.config
+                && config.archon.enabled
             {
                 app.edit_mode = EditMode::MigrationMenu;
             } else {
@@ -1170,48 +1183,72 @@ fn handle_edit_input(
         match key.code {
             KeyCode::Char('1') | KeyCode::Char('l') => {
                 // Local to Archon
-                if let Some(eng) = engine {
-                    app.last_error = None;
-                    info!("starting migration: local -> Archon");
-                    match eng.execute_migration(MigrationDirection::LocalToArchon) {
-                        Ok(exit_code) => {
-                            if exit_code == 0 {
-                                app.last_error = Some("Migration to Archon completed".to_string());
-                            } else {
-                                app.last_error =
-                                    Some(format!("Migration failed with exit code {}", exit_code));
-                            }
+                app.last_error = None;
+                info!("starting migration: local -> Archon");
+
+                // Use existing engine or create a temporary one for migration
+                let migration_result = if let Some(eng) = engine {
+                    eng.execute_migration(MigrationDirection::LocalToArchon)
+                } else {
+                    // Create a temporary engine for migration
+                    match engine::create_engine(&app.repo_path) {
+                        Ok(mut temp_eng) => {
+                            temp_eng.execute_migration(MigrationDirection::LocalToArchon)
                         }
-                        Err(e) => {
-                            app.last_error = Some(format!("Migration error: {}", e));
+                        Err(e) => Err(e),
+                    }
+                };
+
+                match migration_result {
+                    Ok(exit_code) => {
+                        if exit_code == 0 {
+                            app.last_error = Some("Migration to Archon completed".to_string());
+                        } else {
+                            app.last_error =
+                                Some(format!("Migration failed with exit code {}", exit_code));
                         }
+                    }
+                    Err(e) => {
+                        app.last_error = Some(format!("Migration error: {}", e));
                     }
                 }
                 app.edit_mode = EditMode::None;
             }
             KeyCode::Char('2') | KeyCode::Char('a') => {
                 // Archon to Local
-                if let Some(eng) = engine {
-                    app.last_error = None;
-                    info!("starting migration: Archon -> local");
-                    match eng.execute_migration(MigrationDirection::ArchonToLocal) {
-                        Ok(exit_code) => {
-                            if exit_code == 0 {
-                                // Reload tasks after migration
-                                if let Err(e) = app.reload_tasks() {
-                                    app.last_error = Some(format!("Task reload failed: {}", e));
-                                } else {
-                                    app.last_error =
-                                        Some("Migration from Archon completed".to_string());
-                                }
+                app.last_error = None;
+                info!("starting migration: Archon -> local");
+
+                // Use existing engine or create a temporary one for migration
+                let migration_result = if let Some(eng) = engine {
+                    eng.execute_migration(MigrationDirection::ArchonToLocal)
+                } else {
+                    // Create a temporary engine for migration
+                    match engine::create_engine(&app.repo_path) {
+                        Ok(mut temp_eng) => {
+                            temp_eng.execute_migration(MigrationDirection::ArchonToLocal)
+                        }
+                        Err(e) => Err(e),
+                    }
+                };
+
+                match migration_result {
+                    Ok(exit_code) => {
+                        if exit_code == 0 {
+                            // Reload tasks after migration
+                            if let Err(e) = app.reload_tasks() {
+                                app.last_error = Some(format!("Task reload failed: {}", e));
                             } else {
                                 app.last_error =
-                                    Some(format!("Migration failed with exit code {}", exit_code));
+                                    Some("Migration from Archon completed".to_string());
                             }
+                        } else {
+                            app.last_error =
+                                Some(format!("Migration failed with exit code {}", exit_code));
                         }
-                        Err(e) => {
-                            app.last_error = Some(format!("Migration error: {}", e));
-                        }
+                    }
+                    Err(e) => {
+                        app.last_error = Some(format!("Migration error: {}", e));
                     }
                 }
                 app.edit_mode = EditMode::None;
@@ -2433,7 +2470,7 @@ mod tests {
     fn test_app_new() {
         let dir = TempDir::new().unwrap();
         let tasks = TaskList::new(vec![]);
-        let app = App::new(dir.path(), None, tasks);
+        let app = App::new(dir.path(), None, tasks, Config::default());
 
         assert!(app.run.is_none());
         assert!(app.events.is_empty());
@@ -2463,7 +2500,7 @@ mod tests {
 "#).unwrap();
 
         let tasks = TaskList::new(vec![]);
-        let mut app = App::new(dir.path(), None, tasks);
+        let mut app = App::new(dir.path(), None, tasks, Config::default());
 
         app.read_new_events().unwrap();
 
@@ -2485,7 +2522,7 @@ mod tests {
 "#).unwrap();
 
         let tasks = TaskList::new(vec![]);
-        let mut app = App::new(dir.path(), None, tasks);
+        let mut app = App::new(dir.path(), None, tasks, Config::default());
 
         app.read_new_events().unwrap();
         assert_eq!(app.events.len(), 1);
@@ -2530,7 +2567,7 @@ mod tests {
     fn test_toggle_log_source() {
         let dir = TempDir::new().unwrap();
         let tasks = TaskList::new(vec![]);
-        let mut app = App::new(dir.path(), None, tasks);
+        let mut app = App::new(dir.path(), None, tasks, Config::default());
 
         assert_eq!(app.log_source, LogSource::Agent);
 
@@ -2545,7 +2582,7 @@ mod tests {
     fn test_scroll_log() {
         let dir = TempDir::new().unwrap();
         let tasks = TaskList::new(vec![]);
-        let mut app = App::new(dir.path(), None, tasks);
+        let mut app = App::new(dir.path(), None, tasks, Config::default());
 
         // Add some log lines
         for i in 0..20 {
@@ -2594,7 +2631,7 @@ mod tests {
         .unwrap();
 
         let tasks = TaskList::new(vec![]);
-        let mut app = App::new(dir.path(), Some(run), tasks);
+        let mut app = App::new(dir.path(), Some(run), tasks, Config::default());
 
         app.reload_logs().unwrap();
 
@@ -2621,7 +2658,7 @@ mod tests {
         .unwrap();
 
         let tasks = TaskList::new(vec![]);
-        let mut app = App::new(dir.path(), Some(run), tasks);
+        let mut app = App::new(dir.path(), Some(run), tasks, Config::default());
 
         // Switch to validator log
         app.log_source = LogSource::Validator;
@@ -2638,18 +2675,18 @@ mod tests {
         let tasks = TaskList::new(vec![]);
 
         // No run - should return None
-        let app = App::new(dir.path(), None, tasks.clone());
+        let app = App::new(dir.path(), None, tasks.clone(), Config::default());
         assert!(app.agent_log_path().is_none());
 
         // Run with iteration 0 - should return None
         let run = Run::new("run-1".to_string(), GitMode::Branch);
-        let app = App::new(dir.path(), Some(run), tasks.clone());
+        let app = App::new(dir.path(), Some(run), tasks.clone(), Config::default());
         assert!(app.agent_log_path().is_none());
 
         // Run with iteration 1 - should return path
         let mut run = Run::new("run-1".to_string(), GitMode::Branch);
         run.iteration = 1;
-        let app = App::new(dir.path(), Some(run), tasks);
+        let app = App::new(dir.path(), Some(run), tasks, Config::default());
         let path = app.agent_log_path().unwrap();
         assert!(path.ends_with(".ralpher/iterations/1/agent.log"));
     }
@@ -2658,7 +2695,7 @@ mod tests {
     fn test_toggle_clears_log_state() {
         let dir = TempDir::new().unwrap();
         let tasks = TaskList::new(vec![]);
-        let mut app = App::new(dir.path(), None, tasks);
+        let mut app = App::new(dir.path(), None, tasks, Config::default());
 
         // Add some state
         app.log_lines.push("test line".to_string());
@@ -2679,19 +2716,19 @@ mod tests {
         let tasks = TaskList::new(vec![]);
 
         // No run - should return None
-        let app = App::new(dir.path(), None, tasks.clone());
+        let app = App::new(dir.path(), None, tasks.clone(), Config::default());
         assert!(app.run_state().is_none());
 
         // Running run
         let mut run = Run::new("run-1".to_string(), GitMode::Branch);
         run.state = RunState::Running;
-        let app = App::new(dir.path(), Some(run), tasks.clone());
+        let app = App::new(dir.path(), Some(run), tasks.clone(), Config::default());
         assert_eq!(app.run_state(), Some(RunState::Running));
 
         // Paused run
         let mut run = Run::new("run-2".to_string(), GitMode::Branch);
         run.state = RunState::Paused;
-        let app = App::new(dir.path(), Some(run), tasks);
+        let app = App::new(dir.path(), Some(run), tasks, Config::default());
         assert_eq!(app.run_state(), Some(RunState::Paused));
     }
 
@@ -2701,13 +2738,13 @@ mod tests {
         let tasks = TaskList::new(vec![]);
 
         // No run - should not run
-        let app = App::new(dir.path(), None, tasks.clone());
+        let app = App::new(dir.path(), None, tasks.clone(), Config::default());
         assert!(!app.should_run_iteration());
 
         // Paused by user - should not run even if Running
         let mut run = Run::new("run-1".to_string(), GitMode::Branch);
         run.state = RunState::Running;
-        let mut app = App::new(dir.path(), Some(run), tasks.clone());
+        let mut app = App::new(dir.path(), Some(run), tasks.clone(), Config::default());
         app.user_paused = true;
         app.last_interaction = Instant::now() - Duration::from_secs(10); // very idle
         assert!(!app.should_run_iteration());
@@ -2715,7 +2752,7 @@ mod tests {
         // Running, not paused, but not idle enough
         let mut run = Run::new("run-2".to_string(), GitMode::Branch);
         run.state = RunState::Running;
-        let mut app = App::new(dir.path(), Some(run), tasks.clone());
+        let mut app = App::new(dir.path(), Some(run), tasks.clone(), Config::default());
         app.user_paused = false;
         app.last_interaction = Instant::now(); // just interacted
         assert!(!app.should_run_iteration());
@@ -2723,7 +2760,7 @@ mod tests {
         // Running, not paused, idle enough
         let mut run = Run::new("run-3".to_string(), GitMode::Branch);
         run.state = RunState::Running;
-        let mut app = App::new(dir.path(), Some(run), tasks);
+        let mut app = App::new(dir.path(), Some(run), tasks, Config::default());
         app.user_paused = false;
         app.last_interaction = Instant::now() - Duration::from_secs(1); // idle
         assert!(app.should_run_iteration());
