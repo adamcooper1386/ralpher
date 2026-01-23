@@ -114,6 +114,17 @@
       "title": "make initial task generation based on prd instead of manual",
       "status": "done",
       "notes": "Added PRD parser module that extracts user stories and acceptance criteria from markdown PRD files. Integrated into setup wizard to auto-import tasks when a prd.md file is detected. Setup UI now shows imported tasks with acceptance criteria counts, and provides controls to re-import (i) or clear (c) tasks."
+    },
+    {
+      "id": "task-11",
+      "title": "Update ralpher to integrate with Archon for task management",
+      "status": "todo",
+      "acceptance": [
+        "Add archon mcp configuration to tui setup wizard",
+        "Add functionality to tui to migrate from local to archon",
+        "add functionality to tui to migrate from archon to local",
+        "update promts to ai to respect archon configuration, and use archon RAG when appropriate"
+      ]
     }
   ]
 }
