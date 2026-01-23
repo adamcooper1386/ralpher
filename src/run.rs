@@ -21,6 +21,15 @@ const AGENT_LOG_FILE: &str = "agent.log";
 const TASK_UPDATE_FILE: &str = "task_update.json";
 const VALIDATE_FILE: &str = "validate.json";
 
+/// Direction for Archon task migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationDirection {
+    /// Push local tasks to Archon.
+    LocalToArchon,
+    /// Pull tasks from Archon to local.
+    ArchonToLocal,
+}
+
 /// Definition for a new task to be created by the agent.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct NewTaskDef {
@@ -667,6 +676,26 @@ impl RunEngine {
     fn compose_prompt(&self, task: &Task) -> String {
         let mut prompt = String::new();
 
+        // Archon integration header if enabled
+        if self.config.archon.enabled {
+            prompt.push_str("# Archon Integration\n\n");
+            prompt.push_str(
+                "This project uses Archon MCP for knowledge management. You have access to:\n",
+            );
+            prompt.push_str("- `archon:perform_rag_query()` - Query knowledge base for patterns and best practices\n");
+            prompt.push_str("- `archon:search_code_examples()` - Find implementation examples\n");
+            if let Some(project_id) = &self.config.archon.project_id {
+                prompt.push_str(&format!("- Project ID: {}\n", project_id));
+            }
+            prompt.push('\n');
+            if self.config.archon.use_rag {
+                prompt.push_str("**Important:** Use Archon RAG queries to research best practices before implementing. ");
+                prompt.push_str("For high-level architecture decisions, query patterns and security considerations. ");
+                prompt
+                    .push_str("For specific implementation details, search for code examples.\n\n");
+            }
+        }
+
         // Task context
         prompt.push_str("# Current Task\n\n");
         prompt.push_str(&format!("**Task ID:** {}\n", task.id));
@@ -689,11 +718,24 @@ impl RunEngine {
         // Instructions
         prompt.push_str("# Instructions\n\n");
         prompt.push_str("1. Read CLAUDE.md to understand project conventions.\n");
-        prompt.push_str("2. Implement the task above following the acceptance criteria.\n");
-        prompt.push_str("3. Run all checks: `cargo fmt && cargo check && cargo clippy -- -D warnings && cargo test`\n");
-        prompt.push_str(
-            "4. When the task is complete, write a file `.ralpher/task_update.json` with:\n",
-        );
+
+        // Add Archon RAG step if enabled
+        if self.config.archon.enabled && self.config.archon.use_rag {
+            prompt.push_str(
+                "2. Use Archon to research relevant patterns and best practices for this task.\n",
+            );
+            prompt.push_str("3. Implement the task above following the acceptance criteria.\n");
+            prompt.push_str("4. Run all checks: `cargo fmt && cargo check && cargo clippy -- -D warnings && cargo test`\n");
+            prompt.push_str(
+                "5. When the task is complete, write a file `.ralpher/task_update.json` with:\n",
+            );
+        } else {
+            prompt.push_str("2. Implement the task above following the acceptance criteria.\n");
+            prompt.push_str("3. Run all checks: `cargo fmt && cargo check && cargo clippy -- -D warnings && cargo test`\n");
+            prompt.push_str(
+                "4. When the task is complete, write a file `.ralpher/task_update.json` with:\n",
+            );
+        }
         prompt.push_str("   ```json\n");
         prompt.push_str("   {\n");
         prompt.push_str(&format!("     \"task_id\": \"{}\",\n", task.id));
@@ -701,7 +743,15 @@ impl RunEngine {
         prompt.push_str("     \"notes\": \"Brief description of what was done\"\n");
         prompt.push_str("   }\n");
         prompt.push_str("   ```\n");
-        prompt.push_str("5. If blocked, set new_status to \"blocked\" and explain in notes.\n\n");
+
+        // Adjust step numbers based on Archon
+        if self.config.archon.enabled && self.config.archon.use_rag {
+            prompt
+                .push_str("6. If blocked, set new_status to \"blocked\" and explain in notes.\n\n");
+        } else {
+            prompt
+                .push_str("5. If blocked, set new_status to \"blocked\" and explain in notes.\n\n");
+        }
 
         // Task discovery instructions
         prompt.push_str("**Task Discovery:**\n");
@@ -1420,6 +1470,25 @@ impl RunEngine {
             "You are helping to generate implementation tasks from product documents.\n\n",
         );
 
+        // Archon integration header if enabled
+        if self.config.archon.enabled {
+            prompt.push_str("## Archon Integration\n\n");
+            prompt.push_str(
+                "This project uses Archon MCP for knowledge management. You have access to:\n",
+            );
+            prompt.push_str("- `archon:perform_rag_query()` - Query knowledge base for patterns and best practices\n");
+            prompt.push_str("- `archon:search_code_examples()` - Find implementation examples\n");
+            if let Some(project_id) = &self.config.archon.project_id {
+                prompt.push_str(&format!("- Project ID: {}\n", project_id));
+            }
+            prompt.push('\n');
+            if self.config.archon.use_rag {
+                prompt.push_str(
+                    "Consider using Archon RAG to research best practices for task planning.\n\n",
+                );
+            }
+        }
+
         // Read and include product documents
         prompt.push_str("## Product Documents\n\n");
 
@@ -1506,6 +1575,177 @@ impl RunEngine {
         prompt.push_str("- Add only ONE task per iteration\n");
         prompt.push_str("- Only write the `.ralpher/task_update.json` file\n");
         prompt.push_str("- Do not modify any other files\n");
+
+        prompt
+    }
+
+    /// Execute a migration between local tasks and Archon.
+    /// Returns the exit code from the agent command.
+    pub fn execute_migration(&mut self, direction: MigrationDirection) -> Result<i32> {
+        if !self.config.archon.enabled {
+            anyhow::bail!("Archon integration is not enabled in configuration");
+        }
+
+        let agent_config = self.config.agent.as_ref().context(
+            "No agent configured in ralpher.toml. Add [agent] section with type and cmd.",
+        )?;
+
+        if agent_config.cmd.is_empty() {
+            anyhow::bail!("Agent command is empty");
+        }
+
+        // Create migration directory
+        let migration_dir = self.repo_path.join(RALPHER_DIR).join("migrations");
+        fs::create_dir_all(&migration_dir)?;
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let migration_log_path = migration_dir.join(format!("migration_{}.log", timestamp));
+
+        // Compose migration prompt
+        let prompt = self.compose_migration_prompt(direction);
+
+        // Open log file
+        let mut log_file = File::create(&migration_log_path)?;
+
+        let direction_str = match direction {
+            MigrationDirection::LocalToArchon => "local -> Archon",
+            MigrationDirection::ArchonToLocal => "Archon -> local",
+        };
+
+        writeln!(
+            log_file,
+            "=== ralpher migration ===\nDirection: {}\nCommand: {:?}\n\n=== Prompt ===\n{}\n",
+            direction_str, agent_config.cmd, prompt
+        )?;
+
+        info!(direction = %direction_str, "starting migration");
+
+        // Build and execute command
+        let program = &agent_config.cmd[0];
+        let mut args: Vec<&str> = agent_config.cmd[1..].iter().map(|s| s.as_str()).collect();
+        args.push("-p");
+
+        let output = Command::new(program)
+            .args(&args)
+            .arg(&prompt)
+            .current_dir(&self.repo_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .with_context(|| format!("Failed to execute agent command: {}", program))?;
+
+        // Write output to log
+        if !output.stdout.is_empty() {
+            writeln!(log_file, "=== stdout ===")?;
+            log_file.write_all(&output.stdout)?;
+            writeln!(log_file)?;
+        }
+        if !output.stderr.is_empty() {
+            writeln!(log_file, "=== stderr ===")?;
+            log_file.write_all(&output.stderr)?;
+            writeln!(log_file)?;
+        }
+
+        let exit_code = output.status.code().unwrap_or(-1);
+        writeln!(log_file, "=== exit code: {} ===", exit_code)?;
+
+        info!(exit_code, direction = %direction_str, "migration completed");
+
+        // If migrating from Archon to local, reload tasks after migration
+        if direction == MigrationDirection::ArchonToLocal {
+            // The agent should have written updated tasks to ralpher.prd.json
+            // Reload them
+            if let Ok(tasks) = TaskList::load(&self.repo_path) {
+                self.tasks = tasks;
+                debug!("reloaded tasks after migration from Archon");
+            }
+        }
+
+        Ok(exit_code)
+    }
+
+    /// Compose a prompt for migration operations.
+    fn compose_migration_prompt(&self, direction: MigrationDirection) -> String {
+        let mut prompt = String::new();
+
+        match direction {
+            MigrationDirection::LocalToArchon => {
+                prompt.push_str("# Migrate Local Tasks to Archon\n\n");
+                prompt.push_str(
+                    "You need to push the local ralpher tasks to Archon MCP for task management.\n\n",
+                );
+
+                // Include project ID if configured
+                if let Some(project_id) = &self.config.archon.project_id {
+                    prompt.push_str(&format!("## Archon Project ID: {}\n\n", project_id));
+                }
+
+                // Include current tasks
+                prompt.push_str("## Local Tasks to Migrate\n\n");
+                for task in &self.tasks.tasks {
+                    prompt.push_str(&format!("### {} ({})\n", task.title, task.id));
+                    prompt.push_str(&format!("Status: {:?}\n", task.status));
+                    if !task.acceptance.is_empty() {
+                        prompt.push_str("Acceptance:\n");
+                        for criterion in &task.acceptance {
+                            prompt.push_str(&format!("- {}\n", criterion));
+                        }
+                    }
+                    if let Some(notes) = &task.notes {
+                        prompt.push_str(&format!("Notes: {}\n", notes));
+                    }
+                    prompt.push('\n');
+                }
+
+                prompt.push_str("## Instructions\n\n");
+                prompt.push_str("1. Use Archon MCP to create/update tasks for this project\n");
+                prompt.push_str("2. For each local task, call archon:manage_task with action=\"create\" or \"update\"\n");
+                prompt.push_str("3. Map task statuses: todo->\"todo\", in_progress->\"doing\", done->\"done\", blocked->\"blocked\"\n");
+                prompt.push_str("4. Preserve task IDs and acceptance criteria\n");
+                prompt.push_str("5. After migration, write `.ralpher/task_update.json` with:\n");
+                prompt.push_str("   ```json\n");
+                prompt.push_str("   {\"notes\": \"Migrated X tasks to Archon\"}\n");
+                prompt.push_str("   ```\n");
+            }
+            MigrationDirection::ArchonToLocal => {
+                prompt.push_str("# Migrate Tasks from Archon to Local\n\n");
+                prompt.push_str(
+                    "You need to pull tasks from Archon MCP and update the local ralpher task list.\n\n",
+                );
+
+                // Include project ID if configured
+                if let Some(project_id) = &self.config.archon.project_id {
+                    prompt.push_str(&format!("## Archon Project ID: {}\n\n", project_id));
+                }
+
+                prompt.push_str("## Instructions\n\n");
+                prompt.push_str("1. Use Archon MCP to list all tasks for this project:\n");
+                prompt.push_str("   archon:manage_task(action=\"list\", filter_by=\"project\", filter_value=\"<project_id>\")\n");
+                prompt.push_str("2. Convert each Archon task to ralpher format and write to `ralpher.prd.json`\n");
+                prompt.push_str("3. Map task statuses: \"todo\"->todo, \"doing\"->in_progress, \"done\"->done, \"blocked\"->blocked, \"review\"->in_progress\n");
+                prompt.push_str("4. The output format must be:\n");
+                prompt.push_str("   ```json\n");
+                prompt.push_str("   {\n");
+                prompt.push_str("     \"tasks\": [\n");
+                prompt.push_str("       {\n");
+                prompt.push_str("         \"id\": \"task-id\",\n");
+                prompt.push_str("         \"title\": \"Task title\",\n");
+                prompt.push_str("         \"status\": \"todo|in_progress|done|blocked\",\n");
+                prompt.push_str("         \"acceptance\": [\"criterion 1\"],\n");
+                prompt.push_str("         \"notes\": \"optional notes\"\n");
+                prompt.push_str("       }\n");
+                prompt.push_str("     ]\n");
+                prompt.push_str("   }\n");
+                prompt.push_str("   ```\n");
+                prompt.push_str("5. After migration, write `.ralpher/task_update.json` with:\n");
+                prompt.push_str("   ```json\n");
+                prompt.push_str("   {\"notes\": \"Pulled X tasks from Archon\"}\n");
+                prompt.push_str("   ```\n");
+            }
+        }
 
         prompt
     }

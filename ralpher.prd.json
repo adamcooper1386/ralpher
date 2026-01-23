@@ -118,13 +118,14 @@
     {
       "id": "task-11",
       "title": "Update ralpher to integrate with Archon for task management",
-      "status": "todo",
+      "status": "done",
       "acceptance": [
         "Add archon mcp configuration to tui setup wizard",
         "Add functionality to tui to migrate from local to archon",
         "add functionality to tui to migrate from archon to local",
         "update promts to ai to respect archon configuration, and use archon RAG when appropriate"
-      ]
+      ],
+      "notes": "Implemented Archon MCP integration: added ArchonConfig to config.rs with enabled/project_id/use_rag fields, added Archon step to TUI setup wizard (step 4/6), added migration menu ('m' key) with Local-to-Archon and Archon-to-Local options that invoke the AI agent with migration prompts, updated agent prompts (compose_prompt and compose_task_generation_prompt) to include Archon RAG instructions when enabled. All tests pass (122 unit tests + 29 integration tests)."
     }
   ]
 }

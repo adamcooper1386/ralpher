@@ -21,10 +21,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Wrap};
 use tracing::{debug, info, warn};
 
-use crate::config::{Config, GitMode};
+use crate::config::{ArchonConfig, Config, GitMode};
 use crate::engine;
 use crate::event::Event;
 use crate::prd_parser;
+use crate::run::MigrationDirection;
 use crate::run::{Run, RunEngine, RunState};
 use crate::task::{Task, TaskList, TaskStatus};
 
@@ -58,6 +59,8 @@ pub enum SetupStep {
     AgentConfig,
     /// Select git mode (branch/trunk).
     GitMode,
+    /// Configure Archon MCP integration (optional).
+    Archon,
     /// Import or create tasks.
     Tasks,
     /// Review and save configuration.
@@ -76,6 +79,10 @@ pub enum EditMode {
     EditingTask(String), // task ID being edited
     /// Confirming task deletion.
     ConfirmDelete(String), // task ID to delete
+    /// Migration menu (selecting direction).
+    MigrationMenu,
+    /// Migration in progress.
+    MigrationInProgress(MigrationDirection),
 }
 
 /// Detected product files in the directory.
@@ -119,6 +126,10 @@ pub struct SetupState {
     pub agent_cmd: String,
     /// Selected git mode.
     pub git_mode: crate::config::GitMode,
+    /// Archon MCP configuration.
+    pub archon: ArchonConfig,
+    /// Archon project ID input buffer.
+    pub archon_project_id_input: String,
     /// Tasks being created/imported.
     pub tasks: Vec<crate::task::Task>,
     /// Currently focused field in current step.
@@ -210,6 +221,8 @@ impl App {
                 detected,
                 agent_cmd: "claude --print".to_string(), // sensible default
                 git_mode: GitMode::Branch,
+                archon: ArchonConfig::default(),
+                archon_project_id_input: String::new(),
                 tasks: imported_tasks,
                 focused_field: 0,
             },
@@ -736,7 +749,7 @@ pub fn run(repo_path: &Path) -> Result<()> {
                 TuiMode::Normal => {
                     // Check if we're in an edit mode first
                     if app.edit_mode != EditMode::None {
-                        handle_edit_input(&mut app, key)?;
+                        handle_edit_input(&mut app, &mut engine, key)?;
                     } else {
                         handle_normal_input(&mut app, &mut engine, key, repo_path)?;
                     }
@@ -843,6 +856,16 @@ fn handle_setup_input(
                     }
                 }
                 SetupStep::GitMode => {
+                    app.setup.step = SetupStep::Archon;
+                }
+                SetupStep::Archon => {
+                    // Save archon project_id from input buffer if archon is enabled
+                    if app.setup.archon.enabled
+                        && !app.setup.archon_project_id_input.trim().is_empty()
+                    {
+                        app.setup.archon.project_id =
+                            Some(app.setup.archon_project_id_input.trim().to_string());
+                    }
                     app.setup.step = SetupStep::Tasks;
                 }
                 SetupStep::Tasks => {
@@ -850,7 +873,11 @@ fn handle_setup_input(
                 }
                 SetupStep::Review => {
                     // Complete setup: save config and tasks
-                    let config = Config::from_setup(&app.setup.agent_cmd, app.setup.git_mode);
+                    let config = Config::from_setup(
+                        &app.setup.agent_cmd,
+                        app.setup.git_mode,
+                        app.setup.archon.clone(),
+                    );
                     config.save(repo_path)?;
 
                     // Save tasks if any were created
@@ -870,28 +897,59 @@ fn handle_setup_input(
             }
         }
         KeyCode::Backspace => {
-            // In AgentConfig step, backspace removes characters from command
-            // In other steps, it goes back to previous step
-            if app.setup.step == SetupStep::AgentConfig && !app.setup.agent_cmd.is_empty() {
-                app.setup.agent_cmd.pop();
-            } else {
-                // Go back to previous step
-                match app.setup.step {
-                    SetupStep::Welcome => {}
-                    SetupStep::AgentConfig => app.setup.step = SetupStep::Welcome,
-                    SetupStep::GitMode => app.setup.step = SetupStep::AgentConfig,
-                    SetupStep::Tasks => app.setup.step = SetupStep::GitMode,
-                    SetupStep::Review => app.setup.step = SetupStep::Tasks,
+            // Handle backspace based on step
+            match app.setup.step {
+                SetupStep::AgentConfig if !app.setup.agent_cmd.is_empty() => {
+                    app.setup.agent_cmd.pop();
+                }
+                SetupStep::Archon
+                    if app.setup.focused_field == 1
+                        && !app.setup.archon_project_id_input.is_empty() =>
+                {
+                    app.setup.archon_project_id_input.pop();
+                }
+                _ => {
+                    // Go back to previous step
+                    match app.setup.step {
+                        SetupStep::Welcome => {}
+                        SetupStep::AgentConfig => app.setup.step = SetupStep::Welcome,
+                        SetupStep::GitMode => app.setup.step = SetupStep::AgentConfig,
+                        SetupStep::Archon => {
+                            app.setup.focused_field = 0;
+                            app.setup.step = SetupStep::GitMode;
+                        }
+                        SetupStep::Tasks => app.setup.step = SetupStep::Archon,
+                        SetupStep::Review => app.setup.step = SetupStep::Tasks,
+                    }
                 }
             }
         }
         KeyCode::Tab => {
-            // Toggle git mode in GitMode step
-            if app.setup.step == SetupStep::GitMode {
-                app.setup.git_mode = match app.setup.git_mode {
-                    GitMode::Branch => GitMode::Trunk,
-                    GitMode::Trunk => GitMode::Branch,
-                };
+            // Toggle options in certain steps
+            match app.setup.step {
+                SetupStep::GitMode => {
+                    app.setup.git_mode = match app.setup.git_mode {
+                        GitMode::Branch => GitMode::Trunk,
+                        GitMode::Trunk => GitMode::Branch,
+                    };
+                }
+                SetupStep::Archon => {
+                    // Cycle through: enabled toggle (0), project_id input (1), use_rag toggle (2)
+                    app.setup.focused_field = (app.setup.focused_field + 1) % 3;
+                }
+                _ => {}
+            }
+        }
+        KeyCode::Char(' ') if app.setup.step == SetupStep::Archon => {
+            // Space toggles booleans in Archon step
+            match app.setup.focused_field {
+                0 => {
+                    app.setup.archon.enabled = !app.setup.archon.enabled;
+                }
+                2 => {
+                    app.setup.archon.use_rag = !app.setup.archon.use_rag;
+                }
+                _ => {}
             }
         }
         KeyCode::Char('n') if app.setup.step == SetupStep::Tasks => {
@@ -919,9 +977,16 @@ fn handle_setup_input(
             app.setup.tasks.clear();
         }
         KeyCode::Char(c) => {
-            // Text input for agent command
-            if app.setup.step == SetupStep::AgentConfig {
-                app.setup.agent_cmd.push(c);
+            // Text input based on step
+            match app.setup.step {
+                SetupStep::AgentConfig => {
+                    app.setup.agent_cmd.push(c);
+                }
+                SetupStep::Archon if app.setup.focused_field == 1 => {
+                    // Project ID input
+                    app.setup.archon_project_id_input.push(c);
+                }
+                _ => {}
             }
         }
         _ => {}
@@ -1066,6 +1131,16 @@ fn handle_normal_input(
             // Delete selected task (with confirmation)
             app.request_delete_task();
         }
+        KeyCode::Char('m') => {
+            // Migration menu (only show if archon is enabled)
+            if let Some(eng) = engine
+                && eng.config().archon.enabled
+            {
+                app.edit_mode = EditMode::MigrationMenu;
+            } else {
+                app.last_error = Some("Archon integration is not enabled".to_string());
+            }
+        }
 
         // Log scrolling
         KeyCode::Up | KeyCode::Char('k') => app.scroll_log_up(1),
@@ -1083,8 +1158,71 @@ fn handle_normal_input(
 }
 
 /// Handle input in edit mode (editing a task).
-fn handle_edit_input(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()> {
+fn handle_edit_input(
+    app: &mut App,
+    engine: &mut Option<RunEngine>,
+    key: crossterm::event::KeyEvent,
+) -> Result<()> {
     use crossterm::event::KeyCode;
+
+    // Handle migration menu
+    if let EditMode::MigrationMenu = &app.edit_mode {
+        match key.code {
+            KeyCode::Char('1') | KeyCode::Char('l') => {
+                // Local to Archon
+                if let Some(eng) = engine {
+                    app.last_error = None;
+                    info!("starting migration: local -> Archon");
+                    match eng.execute_migration(MigrationDirection::LocalToArchon) {
+                        Ok(exit_code) => {
+                            if exit_code == 0 {
+                                app.last_error = Some("Migration to Archon completed".to_string());
+                            } else {
+                                app.last_error =
+                                    Some(format!("Migration failed with exit code {}", exit_code));
+                            }
+                        }
+                        Err(e) => {
+                            app.last_error = Some(format!("Migration error: {}", e));
+                        }
+                    }
+                }
+                app.edit_mode = EditMode::None;
+            }
+            KeyCode::Char('2') | KeyCode::Char('a') => {
+                // Archon to Local
+                if let Some(eng) = engine {
+                    app.last_error = None;
+                    info!("starting migration: Archon -> local");
+                    match eng.execute_migration(MigrationDirection::ArchonToLocal) {
+                        Ok(exit_code) => {
+                            if exit_code == 0 {
+                                // Reload tasks after migration
+                                if let Err(e) = app.reload_tasks() {
+                                    app.last_error = Some(format!("Task reload failed: {}", e));
+                                } else {
+                                    app.last_error =
+                                        Some("Migration from Archon completed".to_string());
+                                }
+                            } else {
+                                app.last_error =
+                                    Some(format!("Migration failed with exit code {}", exit_code));
+                            }
+                        }
+                        Err(e) => {
+                            app.last_error = Some(format!("Migration error: {}", e));
+                        }
+                    }
+                }
+                app.edit_mode = EditMode::None;
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.edit_mode = EditMode::None;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
 
     // Handle confirmation dialogs first
     if let EditMode::ConfirmDelete(_) = &app.edit_mode {
@@ -1193,6 +1331,7 @@ fn draw_setup_ui(f: &mut ratatui::Frame, app: &App) {
         SetupStep::Welcome => "Welcome",
         SetupStep::AgentConfig => "Agent Configuration",
         SetupStep::GitMode => "Git Mode",
+        SetupStep::Archon => "Archon Integration",
         SetupStep::Tasks => "Tasks",
         SetupStep::Review => "Review & Save",
     };
@@ -1200,8 +1339,9 @@ fn draw_setup_ui(f: &mut ratatui::Frame, app: &App) {
         SetupStep::Welcome => 1,
         SetupStep::AgentConfig => 2,
         SetupStep::GitMode => 3,
-        SetupStep::Tasks => 4,
-        SetupStep::Review => 5,
+        SetupStep::Archon => 4,
+        SetupStep::Tasks => 5,
+        SetupStep::Review => 6,
     };
 
     let header = Paragraph::new(Line::from(vec![
@@ -1213,7 +1353,7 @@ fn draw_setup_ui(f: &mut ratatui::Frame, app: &App) {
         ),
         Span::raw(" - "),
         Span::styled(
-            format!("Step {}/5: {}", step_num, step_name),
+            format!("Step {}/6: {}", step_num, step_name),
             Style::default().fg(Color::Yellow),
         ),
     ]))
@@ -1232,6 +1372,9 @@ fn draw_setup_ui(f: &mut ratatui::Frame, app: &App) {
         SetupStep::Welcome => " Enter: Continue  |  q: Quit ",
         SetupStep::AgentConfig => " Enter: Continue  |  Backspace: Back  |  q: Quit ",
         SetupStep::GitMode => " Tab: Toggle  |  Enter: Continue  |  Backspace: Back  |  q: Quit ",
+        SetupStep::Archon => {
+            " Tab: Next  |  Space: Toggle  |  Enter: Continue  |  Backspace: Back  |  q: Quit "
+        }
         SetupStep::Tasks => {
             if app.setup.detected.prd.is_some() {
                 " n: New  |  i: Re-import  |  c: Clear  |  Enter: Continue  |  Backspace: Back  |  q: Quit "
@@ -1354,6 +1497,101 @@ fn draw_setup_step(f: &mut ratatui::Frame, app: &App, area: Rect) {
                 .wrap(Wrap { trim: true });
             f.render_widget(para, area);
         }
+        SetupStep::Archon => {
+            let focused = app.setup.focused_field;
+
+            // Enabled toggle style
+            let enabled_style = if focused == 0 {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+
+            // Project ID input style
+            let project_id_style = if focused == 1 {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+
+            // RAG toggle style
+            let rag_style = if focused == 2 {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+
+            let enabled_checkbox = if app.setup.archon.enabled {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            let rag_checkbox = if app.setup.archon.use_rag {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+
+            let project_id_display = if focused == 1 {
+                format!("{}_", app.setup.archon_project_id_input)
+            } else if app.setup.archon_project_id_input.is_empty() {
+                "(optional)".to_string()
+            } else {
+                app.setup.archon_project_id_input.clone()
+            };
+
+            let text = vec![
+                Line::from(""),
+                Line::from("Configure Archon MCP integration (optional):"),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Archon is an MCP server for knowledge management and task tracking.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    "If enabled, ralpher will instruct the AI to use Archon for RAG queries.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(format!("{} Enable Archon", enabled_checkbox), enabled_style),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled("Project ID: ", project_id_style),
+                    Span::styled(project_id_display, project_id_style),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("{} Use Archon RAG for context", rag_checkbox),
+                        rag_style,
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Tab: Next field  |  Space: Toggle  |  Enter: Continue",
+                    Style::default().fg(Color::Yellow),
+                )),
+            ];
+            let para = Paragraph::new(text)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Archon Integration "),
+                )
+                .wrap(Wrap { trim: true });
+            f.render_widget(para, area);
+        }
         SetupStep::Tasks => {
             let mut lines = vec![
                 Line::from(""),
@@ -1460,6 +1698,24 @@ fn draw_setup_step(f: &mut ratatui::Frame, app: &App, area: Rect) {
                 GitMode::Trunk => "trunk (direct commits)",
             };
 
+            let archon_status = if app.setup.archon.enabled {
+                let mut status = "enabled".to_string();
+                if let Some(pid) = &app.setup.archon.project_id {
+                    status.push_str(&format!(", project: {}", pid));
+                } else if !app.setup.archon_project_id_input.trim().is_empty() {
+                    status.push_str(&format!(
+                        ", project: {}",
+                        app.setup.archon_project_id_input.trim()
+                    ));
+                }
+                if app.setup.archon.use_rag {
+                    status.push_str(", RAG: on");
+                }
+                status
+            } else {
+                "disabled".to_string()
+            };
+
             let has_product_docs = app.setup.detected.prd.is_some()
                 || app.setup.detected.mission.is_some()
                 || app.setup.detected.tech.is_some();
@@ -1483,6 +1739,7 @@ fn draw_setup_step(f: &mut ratatui::Frame, app: &App, area: Rect) {
                 Line::from(""),
                 Line::from(format!("  Agent command: {}", app.setup.agent_cmd)),
                 Line::from(format!("  Git mode: {}", git_mode_str)),
+                Line::from(format!("  Archon: {}", archon_status)),
                 Line::from(format!("  Tasks: {}", task_status)),
                 Line::from(""),
                 Line::from("Files to be created:"),
@@ -1575,6 +1832,12 @@ fn draw_ui(f: &mut ratatui::Frame, app: &App) {
         }
         EditMode::ConfirmDelete(task_id) => {
             draw_delete_confirm_overlay(f, task_id, size);
+        }
+        EditMode::MigrationMenu => {
+            draw_migration_menu_overlay(f, size);
+        }
+        EditMode::MigrationInProgress(_) => {
+            draw_migration_progress_overlay(f, size);
         }
     }
 }
@@ -1719,6 +1982,87 @@ fn draw_delete_confirm_overlay(f: &mut ratatui::Frame, task_id: &str, size: Rect
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Red))
                 .title(" Confirm Delete "),
+        )
+        .alignment(ratatui::layout::Alignment::Center);
+
+    f.render_widget(para, popup_area);
+}
+
+/// Draw migration menu overlay.
+fn draw_migration_menu_overlay(f: &mut ratatui::Frame, size: Rect) {
+    use ratatui::widgets::Clear;
+
+    // Center the popup
+    let popup_width = size.width.min(55);
+    let popup_height = 12;
+    let popup_x = (size.width.saturating_sub(popup_width)) / 2;
+    let popup_y = (size.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+    // Clear the area
+    f.render_widget(Clear, popup_area);
+
+    let text = vec![
+        Line::from(""),
+        Line::from("Archon Task Migration"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  1 / l : Push local tasks to Archon",
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  2 / a : Pull tasks from Archon to local",
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from(""),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Esc / q : Cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let para = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(" Archon Migration "),
+        )
+        .alignment(ratatui::layout::Alignment::Center);
+
+    f.render_widget(para, popup_area);
+}
+
+/// Draw migration progress overlay.
+fn draw_migration_progress_overlay(f: &mut ratatui::Frame, size: Rect) {
+    use ratatui::widgets::Clear;
+
+    // Center the popup
+    let popup_width = size.width.min(40);
+    let popup_height = 5;
+    let popup_x = (size.width.saturating_sub(popup_width)) / 2;
+    let popup_y = (size.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+    // Clear the area
+    f.render_widget(Clear, popup_area);
+
+    let text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Migration in progress...",
+            Style::default().fg(Color::Yellow),
+        )),
+    ];
+
+    let para = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(" Migrating "),
         )
         .alignment(ratatui::layout::Alignment::Center);
 

@@ -6,6 +6,20 @@ use crate::policy::PolicyConfig;
 
 const CONFIG_FILE_NAME: &str = "ralpher.toml";
 
+/// Archon MCP server configuration for task management integration.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct ArchonConfig {
+    /// Whether Archon integration is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Project ID in Archon for this ralpher project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// Whether to use Archon RAG for context during agent execution.
+    #[serde(default)]
+    pub use_rag: bool,
+}
+
 /// Git operation mode for checkpointing.
 #[derive(Debug, Serialize, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -48,6 +62,9 @@ pub struct Config {
     /// Maximum iterations before pausing (default: 100).
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
+    /// Archon MCP server configuration for task management integration.
+    #[serde(default)]
+    pub archon: ArchonConfig,
 }
 
 impl Config {
@@ -59,6 +76,7 @@ impl Config {
             validators: Vec::new(),
             policy: PolicyConfig::default(),
             max_iterations: DEFAULT_MAX_ITERATIONS,
+            archon: ArchonConfig::default(),
         }
     }
 }
@@ -183,6 +201,21 @@ impl Config {
             }
         }
 
+        // Archon config (only write if enabled)
+        if self.archon.enabled {
+            content.push_str("\n[archon]\n");
+            content.push_str("enabled = true\n");
+            if let Some(project_id) = &self.archon.project_id {
+                content.push_str(&format!(
+                    "project_id = \"{}\"\n",
+                    project_id.replace('\"', "\\\"")
+                ));
+            }
+            if self.archon.use_rag {
+                content.push_str("use_rag = true\n");
+            }
+        }
+
         std::fs::write(&config_path, content)
             .with_context(|| format!("Failed to write {}", config_path.display()))?;
 
@@ -190,7 +223,7 @@ impl Config {
     }
 
     /// Create a config from setup wizard input.
-    pub fn from_setup(agent_cmd: &str, git_mode: GitMode) -> Self {
+    pub fn from_setup(agent_cmd: &str, git_mode: GitMode, archon: ArchonConfig) -> Self {
         // Parse the command string into parts
         let cmd: Vec<String> =
             shell_words::split(agent_cmd).unwrap_or_else(|_| vec![agent_cmd.to_string()]);
@@ -204,6 +237,7 @@ impl Config {
             validators: Vec::new(),
             policy: PolicyConfig::default(),
             max_iterations: DEFAULT_MAX_ITERATIONS,
+            archon,
         }
     }
 }
@@ -321,5 +355,70 @@ max_iterations = 50
         assert!(config.agent.is_none());
         assert!(config.validators.is_empty());
         assert_eq!(config.max_iterations, DEFAULT_MAX_ITERATIONS);
+        assert!(!config.archon.enabled);
+    }
+
+    #[test]
+    fn test_load_config_with_archon() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("ralpher.toml");
+        let mut file = std::fs::File::create(&config_path).unwrap();
+        writeln!(
+            file,
+            r#"
+[archon]
+enabled = true
+project_id = "proj-123"
+use_rag = true
+"#
+        )
+        .unwrap();
+
+        let (config, _) = Config::load(dir.path()).unwrap();
+        assert!(config.archon.enabled);
+        assert_eq!(config.archon.project_id, Some("proj-123".to_string()));
+        assert!(config.archon.use_rag);
+    }
+
+    #[test]
+    fn test_load_config_archon_disabled_default() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("ralpher.toml");
+        let mut file = std::fs::File::create(&config_path).unwrap();
+        writeln!(file, "# minimal config").unwrap();
+
+        let (config, _) = Config::load(dir.path()).unwrap();
+        assert!(!config.archon.enabled);
+        assert!(config.archon.project_id.is_none());
+        assert!(!config.archon.use_rag);
+    }
+
+    #[test]
+    fn test_save_config_with_archon() {
+        let dir = TempDir::new().unwrap();
+        let mut config = Config::new();
+        config.archon.enabled = true;
+        config.archon.project_id = Some("test-project".to_string());
+        config.archon.use_rag = true;
+
+        config.save(dir.path()).unwrap();
+
+        // Reload and verify
+        let (loaded, _) = Config::load(dir.path()).unwrap();
+        assert!(loaded.archon.enabled);
+        assert_eq!(loaded.archon.project_id, Some("test-project".to_string()));
+        assert!(loaded.archon.use_rag);
+    }
+
+    #[test]
+    fn test_save_config_without_archon_no_section() {
+        let dir = TempDir::new().unwrap();
+        let config = Config::new(); // Archon disabled by default
+
+        config.save(dir.path()).unwrap();
+
+        // Check that [archon] section is not present in the file
+        let content = std::fs::read_to_string(dir.path().join("ralpher.toml")).unwrap();
+        assert!(!content.contains("[archon]"));
     }
 }
