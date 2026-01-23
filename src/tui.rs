@@ -982,8 +982,11 @@ fn handle_normal_input(
                         }
                     }
                 }
-                Some(RunState::Idle) | None => {
-                    // No run or idle - start a new one
+                Some(RunState::Idle)
+                | Some(RunState::Completed)
+                | Some(RunState::Aborted)
+                | None => {
+                    // No run, idle, or terminal state - start a new one
                     match engine::create_engine(repo_path) {
                         Ok(mut eng) => {
                             if let Err(e) = eng.start() {
@@ -999,7 +1002,6 @@ fn handle_normal_input(
                         }
                     }
                 }
-                _ => {} // No action for terminal states
             }
         }
         KeyCode::Char('a') => {
@@ -2014,14 +2016,13 @@ fn draw_footer(f: &mut ratatui::Frame, app: &App, area: Rect) {
             ));
             spans.push(Span::raw(" Resume  "));
         }
-        Some(RunState::Idle) | None => {
+        Some(RunState::Idle) | Some(RunState::Completed) | Some(RunState::Aborted) | None => {
             spans.push(Span::styled(
                 " ␣ ",
                 Style::default().add_modifier(Modifier::REVERSED),
             ));
             spans.push(Span::raw(" Start  "));
         }
-        _ => {}
     }
 
     // Add abort and skip for active runs
