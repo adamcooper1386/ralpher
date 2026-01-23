@@ -1360,14 +1360,27 @@ fn draw_setup_step(f: &mut ratatui::Frame, app: &App, area: Rect) {
             ];
 
             // Show import status
+            let has_product_docs = app.setup.detected.prd.is_some()
+                || app.setup.detected.mission.is_some()
+                || app.setup.detected.tech.is_some();
+
             if app.setup.detected.prd.is_some() {
                 if app.setup.tasks.is_empty() {
                     lines.push(Line::from(Span::styled(
                         "  PRD file detected but no user stories found.",
                         Style::default().fg(Color::Yellow),
                     )));
+                    lines.push(Line::from(""));
                     lines.push(Line::from(Span::styled(
-                        "  Press 'n' to add tasks manually.",
+                        "  Options:",
+                        Style::default().fg(Color::Cyan),
+                    )));
+                    lines.push(Line::from(Span::styled(
+                        "  • Press 'n' to add tasks manually",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                    lines.push(Line::from(Span::styled(
+                        "  • Press Enter to continue - AI will generate tasks from PRD",
                         Style::default().fg(Color::DarkGray),
                     )));
                 } else {
@@ -1394,14 +1407,34 @@ fn draw_setup_step(f: &mut ratatui::Frame, app: &App, area: Rect) {
                     }
                 }
             } else if app.setup.tasks.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    "  No PRD file detected and no tasks yet.",
-                    Style::default().fg(Color::DarkGray),
-                )));
-                lines.push(Line::from(Span::styled(
-                    "  Press 'n' to add tasks manually, or continue without tasks.",
-                    Style::default().fg(Color::DarkGray),
-                )));
+                if has_product_docs {
+                    lines.push(Line::from(Span::styled(
+                        "  Product documents detected.",
+                        Style::default().fg(Color::Green),
+                    )));
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        "  Options:",
+                        Style::default().fg(Color::Cyan),
+                    )));
+                    lines.push(Line::from(Span::styled(
+                        "  • Press 'n' to add tasks manually",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                    lines.push(Line::from(Span::styled(
+                        "  • Press Enter to continue - AI will generate tasks from docs",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        "  No PRD file detected and no tasks yet.",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                    lines.push(Line::from(Span::styled(
+                        "  Press 'n' to add tasks manually, or continue without tasks.",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
             } else {
                 for (i, task) in app.setup.tasks.iter().enumerate() {
                     lines.push(Line::from(format!("  {}. {}", i + 1, task.title)));
@@ -1425,6 +1458,20 @@ fn draw_setup_step(f: &mut ratatui::Frame, app: &App, area: Rect) {
                 GitMode::Trunk => "trunk (direct commits)",
             };
 
+            let has_product_docs = app.setup.detected.prd.is_some()
+                || app.setup.detected.mission.is_some()
+                || app.setup.detected.tech.is_some();
+
+            let task_status = if app.setup.tasks.is_empty() {
+                if has_product_docs {
+                    "0 (AI will generate from product docs)".to_string()
+                } else {
+                    "0 (none defined)".to_string()
+                }
+            } else {
+                app.setup.tasks.len().to_string()
+            };
+
             let text = vec![
                 Line::from(""),
                 Line::from(Span::styled(
@@ -1434,7 +1481,7 @@ fn draw_setup_step(f: &mut ratatui::Frame, app: &App, area: Rect) {
                 Line::from(""),
                 Line::from(format!("  Agent command: {}", app.setup.agent_cmd)),
                 Line::from(format!("  Git mode: {}", git_mode_str)),
-                Line::from(format!("  Tasks: {}", app.setup.tasks.len())),
+                Line::from(format!("  Tasks: {}", task_status)),
                 Line::from(""),
                 Line::from("Files to be created:"),
                 Line::from(Span::styled(

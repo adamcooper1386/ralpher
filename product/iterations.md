@@ -143,3 +143,25 @@ Track what was accomplished in each development iteration.
 - Dynamic footer shows available controls based on run state
 - Added 6 new unit tests for skip_task and TuiAction
 - All checks pass: fmt, clippy, test (101 unit tests), bintest (29 integration tests)
+
+## Iteration 10
+
+- Implemented AI-driven task generation from product documents
+- Extended `TaskUpdate` struct with:
+  - `new_task: Option<NewTaskDef>` - for AI to create new tasks
+  - `task_generation_complete: bool` - signal when task list is complete
+  - Made `task_id` and `new_status` optional for task-generation-only updates
+- Added `NewTaskDef` struct with title, acceptance criteria, and notes fields
+- Added `Run.task_generation_complete` field to persist generation state
+- Added `task_generation_iteration()` to RunEngine:
+  - Executes when no tasks exist and generation not complete
+  - Composes prompt with product docs (mission.md, prd.md, tech.md)
+  - Shows existing tasks to avoid duplicates
+  - AI adds ONE task per iteration until signaling complete
+- Updated `compose_prompt()` to include task discovery instructions
+  - AI can add new tasks during normal iterations too
+- Added `generate_task_id()` helper for unique task ID generation
+- Updated TUI setup wizard:
+  - Tasks step shows "AI will generate from docs" option when PRD detected
+  - Review step indicates task generation mode when task list is empty
+- All checks pass: fmt, clippy, test (118 unit tests), bintest (29 integration tests)

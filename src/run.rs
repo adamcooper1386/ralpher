@@ -21,19 +21,40 @@ const AGENT_LOG_FILE: &str = "agent.log";
 const TASK_UPDATE_FILE: &str = "task_update.json";
 const VALIDATE_FILE: &str = "validate.json";
 
+/// Definition for a new task to be created by the agent.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct NewTaskDef {
+    /// Task title (required).
+    pub title: String,
+    /// Acceptance criteria (optional).
+    #[serde(default)]
+    pub acceptance: Vec<String>,
+    /// Notes about the task (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
 /// Task update written by the agent to report progress.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TaskUpdate {
-    /// ID of the task being updated.
-    pub task_id: String,
-    /// New status for the task.
-    pub new_status: TaskStatus,
+    /// ID of the task being updated (optional when only creating new tasks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// New status for the task (optional when only creating new tasks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_status: Option<TaskStatus>,
     /// Optional notes about the update.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
     /// Optional evidence (paths changed, commands run).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Vec<String>>,
+    /// New task to add to the task list (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_task: Option<NewTaskDef>,
+    /// Signal that the AI believes the task list is complete (no more tasks needed).
+    #[serde(default)]
+    pub task_generation_complete: bool,
 }
 
 /// Result of running a single validator command.
@@ -110,6 +131,9 @@ pub struct Run {
     pub run_branch: Option<String>,
     /// Last checkpoint commit SHA.
     pub last_checkpoint: Option<String>,
+    /// Whether the AI has signaled that the task list is complete.
+    #[serde(default)]
+    pub task_generation_complete: bool,
 }
 
 impl Run {
@@ -131,6 +155,7 @@ impl Run {
             original_branch: None,
             run_branch: None,
             last_checkpoint: None,
+            task_generation_complete: false,
         }
     }
 
@@ -286,6 +311,47 @@ impl RunEngine {
         &self.repo_path
     }
 
+    /// Generate a unique task ID from a title.
+    /// Creates a slug from the title and appends a number if needed to ensure uniqueness.
+    fn generate_task_id(&self, title: &str) -> String {
+        // Create base slug from title
+        let base_slug: String = title
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '-' })
+            .collect::<String>()
+            .split('-')
+            .filter(|s| !s.is_empty())
+            .take(4) // Take first 4 words max
+            .collect::<Vec<_>>()
+            .join("-");
+
+        let base_slug = if base_slug.is_empty() {
+            "task".to_string()
+        } else {
+            base_slug
+        };
+
+        // Check if this ID already exists
+        let existing_ids: std::collections::HashSet<_> =
+            self.tasks.tasks.iter().map(|t| t.id.as_str()).collect();
+
+        if !existing_ids.contains(base_slug.as_str()) {
+            return base_slug;
+        }
+
+        // Append numbers until we find a unique ID
+        for i in 2..1000 {
+            let candidate = format!("{}-{}", base_slug, i);
+            if !existing_ids.contains(candidate.as_str()) {
+                return candidate;
+            }
+        }
+
+        // Fallback to timestamp-based ID
+        format!("task-{}", self.run.iteration)
+    }
+
     /// Initialize and start the run.
     /// Sets up the workspace (creates branch in branch mode) and emits RunStarted.
     pub fn start(&mut self) -> Result<()> {
@@ -353,16 +419,23 @@ impl RunEngine {
         let task = match current_task {
             Some(t) => t,
             None => {
-                // No more tasks - run is complete
-                info!("no more tasks, completing run");
-                self.complete()?;
-                return Ok(IterationResult {
-                    success: true,
-                    agent_exit_code: None,
-                    validators_passed: true,
-                    policy_passed: true,
-                    checkpoint_sha: None,
-                });
+                // No tasks available - check if we should generate tasks or complete
+                if self.run.task_generation_complete {
+                    // Task generation is done and all tasks are complete
+                    info!("no more tasks and task generation complete, completing run");
+                    self.complete()?;
+                    return Ok(IterationResult {
+                        success: true,
+                        agent_exit_code: None,
+                        validators_passed: true,
+                        policy_passed: true,
+                        checkpoint_sha: None,
+                    });
+                } else {
+                    // Need to generate tasks - run a task generation iteration
+                    info!("no tasks available, running task generation iteration");
+                    return self.task_generation_iteration();
+                }
             }
         };
 
@@ -419,28 +492,64 @@ impl RunEngine {
         })?;
 
         // Parse task update from agent
-        if let Some(update) = self.parse_task_update()
-            && let Some(t) = self.tasks.get_mut(&update.task_id)
-        {
-            let old_status = t.status;
-            t.status = update.new_status;
-            info!(
-                task_id = %update.task_id,
-                old_status = ?old_status,
-                new_status = ?update.new_status,
-                "task status changed"
-            );
-            if let Some(notes) = update.notes {
-                t.notes = Some(notes);
+        if let Some(update) = self.parse_task_update() {
+            // Handle task_generation_complete signal
+            if update.task_generation_complete {
+                info!("agent signaled task generation is complete");
+                self.run.task_generation_complete = true;
             }
-            self.tasks.save()?;
 
-            self.event_log.emit_now(EventKind::TaskStatusChanged {
-                run_id: self.run.run_id.clone(),
-                task_id: update.task_id,
-                old_status,
-                new_status: update.new_status,
-            })?;
+            // Handle new task creation
+            if let Some(new_task_def) = update.new_task {
+                let new_id = self.generate_task_id(&new_task_def.title);
+                info!(task_id = %new_id, title = %new_task_def.title, "agent created new task");
+
+                let new_task = Task {
+                    id: new_id.clone(),
+                    title: new_task_def.title,
+                    status: TaskStatus::Todo,
+                    acceptance: new_task_def.acceptance,
+                    validators: Vec::new(),
+                    notes: new_task_def.notes,
+                };
+
+                self.tasks.tasks.push(new_task);
+                self.tasks.save()?;
+
+                // Emit event for new task (using TaskStatusChanged with a synthetic "created" transition)
+                self.event_log.emit_now(EventKind::TaskStatusChanged {
+                    run_id: self.run.run_id.clone(),
+                    task_id: new_id,
+                    old_status: TaskStatus::Todo, // Treat as "created in todo state"
+                    new_status: TaskStatus::Todo,
+                })?;
+            }
+
+            // Handle existing task status update
+            if let Some(task_id) = &update.task_id
+                && let Some(new_status) = update.new_status
+                && let Some(t) = self.tasks.get_mut(task_id)
+            {
+                let old_status = t.status;
+                t.status = new_status;
+                info!(
+                    task_id = %task_id,
+                    old_status = ?old_status,
+                    new_status = ?new_status,
+                    "task status changed"
+                );
+                if let Some(notes) = update.notes.clone() {
+                    t.notes = Some(notes);
+                }
+                self.tasks.save()?;
+
+                self.event_log.emit_now(EventKind::TaskStatusChanged {
+                    run_id: self.run.run_id.clone(),
+                    task_id: task_id.clone(),
+                    old_status,
+                    new_status,
+                })?;
+            }
         } else {
             trace!("no task update from agent");
         }
@@ -592,7 +701,22 @@ impl RunEngine {
         prompt.push_str("     \"notes\": \"Brief description of what was done\"\n");
         prompt.push_str("   }\n");
         prompt.push_str("   ```\n");
-        prompt.push_str("5. If blocked, set new_status to \"blocked\" and explain in notes.\n");
+        prompt.push_str("5. If blocked, set new_status to \"blocked\" and explain in notes.\n\n");
+
+        // Task discovery instructions
+        prompt.push_str("**Task Discovery:**\n");
+        prompt.push_str("If while working you discover additional work that should be tracked as a separate task, ");
+        prompt.push_str("you can add a `new_task` field to the task_update.json:\n");
+        prompt.push_str("```json\n");
+        prompt.push_str("{\n");
+        prompt.push_str(&format!("  \"task_id\": \"{}\",\n", task.id));
+        prompt.push_str("  \"new_status\": \"done\",\n");
+        prompt.push_str("  \"new_task\": {\n");
+        prompt.push_str("    \"title\": \"New task title\",\n");
+        prompt.push_str("    \"acceptance\": [\"criterion 1\", \"criterion 2\"]\n");
+        prompt.push_str("  }\n");
+        prompt.push_str("}\n");
+        prompt.push_str("```\n");
 
         prompt
     }
@@ -1125,6 +1249,265 @@ impl RunEngine {
     /// Get the config.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Execute a task generation iteration.
+    /// This is called when there are no tasks and task_generation_complete is false.
+    /// The agent is prompted to read product documents and generate tasks.
+    fn task_generation_iteration(&mut self) -> Result<IterationResult> {
+        // Increment iteration
+        self.run.iteration += 1;
+        self.run.current_task_id = None; // No specific task
+        info!(
+            iteration = self.run.iteration,
+            "starting task generation iteration"
+        );
+
+        // Emit IterationStarted with a special marker
+        self.event_log.emit_now(EventKind::IterationStarted {
+            run_id: self.run.run_id.clone(),
+            iteration: self.run.iteration,
+            task_id: "_task_generation".to_string(),
+        })?;
+
+        // Execute agent with task generation prompt
+        debug!("executing agent for task generation");
+        let agent_exit_code = match self.execute_task_generation_agent() {
+            Ok(code) => {
+                debug!(exit_code = code, "agent completed");
+                Some(code)
+            }
+            Err(e) => {
+                warn!(error = %e, "agent execution error");
+                Some(-1)
+            }
+        };
+
+        self.event_log.emit_now(EventKind::AgentCompleted {
+            run_id: self.run.run_id.clone(),
+            iteration: self.run.iteration,
+            exit_code: agent_exit_code,
+        })?;
+
+        // Parse task update from agent (may contain new_task and/or task_generation_complete)
+        if let Some(update) = self.parse_task_update() {
+            // Handle task_generation_complete signal
+            if update.task_generation_complete {
+                info!("agent signaled task generation is complete");
+                self.run.task_generation_complete = true;
+            }
+
+            // Handle new task creation
+            if let Some(new_task_def) = update.new_task {
+                let new_id = self.generate_task_id(&new_task_def.title);
+                info!(task_id = %new_id, title = %new_task_def.title, "agent created new task");
+
+                let new_task = Task {
+                    id: new_id.clone(),
+                    title: new_task_def.title,
+                    status: TaskStatus::Todo,
+                    acceptance: new_task_def.acceptance,
+                    validators: Vec::new(),
+                    notes: new_task_def.notes,
+                };
+
+                self.tasks.tasks.push(new_task);
+                self.tasks.save()?;
+
+                self.event_log.emit_now(EventKind::TaskStatusChanged {
+                    run_id: self.run.run_id.clone(),
+                    task_id: new_id,
+                    old_status: TaskStatus::Todo,
+                    new_status: TaskStatus::Todo,
+                })?;
+            }
+        } else {
+            trace!("no task update from agent during task generation");
+        }
+
+        // Emit IterationCompleted
+        let success = agent_exit_code == Some(0);
+        self.event_log.emit_now(EventKind::IterationCompleted {
+            run_id: self.run.run_id.clone(),
+            iteration: self.run.iteration,
+            success,
+        })?;
+
+        // Save state
+        self.run.save(&self.repo_path)?;
+
+        Ok(IterationResult {
+            success,
+            agent_exit_code,
+            validators_passed: true, // No validators during task generation
+            policy_passed: true,     // No policy during task generation
+            checkpoint_sha: None,    // No checkpoint during task generation
+        })
+    }
+
+    /// Execute the agent for task generation.
+    /// Returns the exit code.
+    fn execute_task_generation_agent(&self) -> Result<i32> {
+        let agent_config = self.config.agent.as_ref().context(
+            "No agent configured in ralpher.toml. Add [agent] section with type and cmd.",
+        )?;
+
+        if agent_config.cmd.is_empty() {
+            anyhow::bail!("Agent command is empty");
+        }
+
+        // Create iteration directory
+        let iter_dir = self.iteration_dir(self.run.iteration);
+        fs::create_dir_all(&iter_dir)?;
+
+        // Remove any existing task_update.json
+        let task_update_path = self.task_update_path();
+        if task_update_path.exists() {
+            fs::remove_file(&task_update_path).ok();
+        }
+
+        // Compose the task generation prompt
+        let prompt = self.compose_task_generation_prompt();
+
+        // Open log file
+        let log_path = iter_dir.join(AGENT_LOG_FILE);
+        let mut log_file = File::create(&log_path)?;
+
+        writeln!(
+            log_file,
+            "=== ralpher task generation ===\nIteration: {}\nCommand: {:?}\n\n=== Prompt ===\n{}\n",
+            self.run.iteration, agent_config.cmd, prompt
+        )?;
+
+        // Build and execute command
+        let program = &agent_config.cmd[0];
+        let mut args: Vec<&str> = agent_config.cmd[1..].iter().map(|s| s.as_str()).collect();
+        args.push("-p");
+
+        let output = Command::new(program)
+            .args(&args)
+            .arg(&prompt)
+            .current_dir(&self.repo_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .with_context(|| format!("Failed to execute agent command: {}", program))?;
+
+        // Write output to log
+        if !output.stdout.is_empty() {
+            writeln!(log_file, "=== stdout ===")?;
+            log_file.write_all(&output.stdout)?;
+            writeln!(log_file)?;
+        }
+        if !output.stderr.is_empty() {
+            writeln!(log_file, "=== stderr ===")?;
+            log_file.write_all(&output.stderr)?;
+            writeln!(log_file)?;
+        }
+
+        let exit_code = output.status.code().unwrap_or(-1);
+        writeln!(log_file, "=== exit code: {} ===", exit_code)?;
+
+        Ok(exit_code)
+    }
+
+    /// Compose the prompt for task generation.
+    fn compose_task_generation_prompt(&self) -> String {
+        let mut prompt = String::new();
+
+        prompt.push_str("# Task Generation Mode\n\n");
+        prompt.push_str(
+            "You are helping to generate implementation tasks from product documents.\n\n",
+        );
+
+        // Read and include product documents
+        prompt.push_str("## Product Documents\n\n");
+
+        // Try to find and include product docs
+        let doc_paths = [
+            (
+                "Mission",
+                vec!["mission.md", "product/mission.md", "docs/mission.md"],
+            ),
+            (
+                "PRD",
+                vec!["prd.md", "product/prd.md", "docs/prd.md", "PRD.md"],
+            ),
+            (
+                "Tech",
+                vec!["tech.md", "product/tech.md", "docs/tech.md", "TECH.md"],
+            ),
+        ];
+
+        for (doc_name, paths) in doc_paths {
+            for path in paths {
+                let full_path = self.repo_path.join(path);
+                if full_path.exists()
+                    && let Ok(content) = fs::read_to_string(&full_path)
+                {
+                    prompt.push_str(&format!("### {} ({})\n\n", doc_name, path));
+                    // Truncate if too long
+                    let content = if content.len() > 10000 {
+                        format!("{}...\n[truncated]", &content[..10000])
+                    } else {
+                        content
+                    };
+                    prompt.push_str(&content);
+                    prompt.push_str("\n\n");
+                    break;
+                }
+            }
+        }
+
+        // Include existing tasks
+        if !self.tasks.tasks.is_empty() {
+            prompt.push_str("## Existing Tasks\n\n");
+            prompt.push_str("The following tasks have already been created:\n\n");
+            for task in &self.tasks.tasks {
+                prompt.push_str(&format!("- **{}**: {}\n", task.id, task.title));
+                for criterion in &task.acceptance {
+                    prompt.push_str(&format!("  - {}\n", criterion));
+                }
+            }
+            prompt.push('\n');
+        }
+
+        // Instructions
+        prompt.push_str("## Instructions\n\n");
+        prompt.push_str(
+            "Based on the product documents above, generate ONE new implementation task.\n\n",
+        );
+        prompt.push_str("Requirements:\n");
+        prompt.push_str("1. The task should be a concrete, implementable piece of work\n");
+        prompt.push_str("2. Do NOT duplicate any existing tasks listed above\n");
+        prompt.push_str("3. Focus on the most important/foundational tasks first\n");
+        prompt.push_str("4. Include clear acceptance criteria for each task\n\n");
+
+        prompt.push_str("Write a file `.ralpher/task_update.json` with this structure:\n");
+        prompt.push_str("```json\n");
+        prompt.push_str("{\n");
+        prompt.push_str("  \"new_task\": {\n");
+        prompt.push_str("    \"title\": \"Short descriptive title\",\n");
+        prompt.push_str("    \"acceptance\": [\n");
+        prompt.push_str("      \"First acceptance criterion\",\n");
+        prompt.push_str("      \"Second acceptance criterion\"\n");
+        prompt.push_str("    ],\n");
+        prompt.push_str("    \"notes\": \"Optional implementation notes\"\n");
+        prompt.push_str("  },\n");
+        prompt.push_str("  \"task_generation_complete\": false\n");
+        prompt.push_str("}\n");
+        prompt.push_str("```\n\n");
+
+        prompt.push_str("When you believe the task list is COMPLETE and covers all requirements ");
+        prompt.push_str("from the product documents, set `task_generation_complete` to `true` ");
+        prompt.push_str("and omit `new_task`.\n\n");
+
+        prompt.push_str("IMPORTANT:\n");
+        prompt.push_str("- Add only ONE task per iteration\n");
+        prompt.push_str("- Only write the `.ralpher/task_update.json` file\n");
+        prompt.push_str("- Do not modify any other files\n");
+
+        prompt
     }
 }
 
